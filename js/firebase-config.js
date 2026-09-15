@@ -10,15 +10,15 @@ export const firebaseConfig = {
   appId: "1:632212909410:web:be8263f65fa8fe8402d03b"
 };
 
-// Optional: restrict who may sign in, by email domain. Leave it EMPTY to let in any account your
-// Firebase project accepts (email/password accounts you created yourself, and - once you switch
-// Google sign-in on - any Google account).
+// Who may sign in. EMPTY (the setting below) means **any Google account** can sign in, plus any
+// email/password account you created in the Firebase console. That is the intended setup here.
 //
-// IMPORTANT: enabling Google sign-in in the Firebase console lets ANY Google account through,
-// because firestore.rules only asks for "a signed-in user". If you turn Google sign-in on, put
-// your own domain here so outsiders are signed straight back out:
+// If you ever want to narrow it, list email domains and/or whole addresses - anyone else is
+// signed straight back out with a message:
 //
-//   export const allowedEmailDomains = ["mgocandoniaccounting.org"];
+//   export const allowedEmailDomains = ["mgocandoniaccounting.org"];          // a whole domain
+//   export const allowedEmailDomains = ["juan@gmail.com", "maria@gmail.com"]; // specific people
 //
+// Worth knowing either way: firestore.rules only asks for "a signed-in user", so while this list
+// is empty, anyone with a Google account who finds the site's address can sign in and edit data.
 export const allowedEmailDomains = [];
- 
