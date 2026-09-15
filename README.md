@@ -18,28 +18,33 @@ the two registers' data and billing stay independent.
   view: Receipt Qty, Issue Qty + Office, Balance Qty). Recording a new item lets you enter its
   opening balance directly (for onboarding what's already on the shelf) or add stock later as a
   dated Receipt.
-- **RIS (Requisition and Issue Slip)** - Appendix 48, generated per issuance, and used **only for
-  Consumed Inventory** - stock issued to an office for its own internal use. A RIS starts as a
-  Draft (what an office is requesting); **Issue** confirms the actual quantity released and
-  deducts it from that item's Stock Card/Ledger Card in the same step, always recording it as
-  Consumed by the requesting office/department. An issued RIS can be reversed (restoring the stock
-  and returning it to Draft) if it was issued in error.
-- **Acknowledgement Receipt (AR)** - used **only for Distributed Inventory** - stock given out to
-  a barangay, beneficiary, or the public. There's no official COA form for this (no reference was
-  available to match), so it was designed to follow standard LGU distribution-record practice:
-  Recipient name and Barangay/Address, a Purpose, an item table (Stock No./Description/Unit/Qty
-  Requested/Qty Issued), and three signature blocks (Released by / Received by / Witnessed by). It
-  follows the same Draft -> **Issue** -> reverse lifecycle as RIS: Issue deducts stock and records
-  it as Distributed to that recipient; an issued AR can likewise be reversed if issued in error.
-- **RSMI (Report of Supplies and Materials Issued)** - Appendix 40, generated on demand for any
-  date range: pulls every issued RIS line in that range and recaps it by Stock No., matching the
-  official form and its recapitulation section exactly. (RSMI recaps RIS/Consumed issuances only,
-  matching the official form's scope - Acknowledgement Receipts don't have an equivalent recap
-  report.)
-- **Consumed Inventory** / **Distributed Inventory** - the two issuance reports the office asked
-  for as their own tabs, each filterable by date range and search, with running totals and its own
-  CSV export. Consumed pulls every issued RIS line; Distributed pulls every issued Acknowledgement
-  Receipt line and additionally shows who/where each item went.
+- **Consumed Inventory** and **Distributed Inventory** are expandable sidebar groups, not single
+  tabs - click either heading to reveal its sub-items:
+  - **Consumed Inventory** expands to **RIS** and **RSMI** (no separate "Report" item here - RSMI
+    already is Consumed Inventory's own report):
+    - **RIS (Requisition and Issue Slip)** - Appendix 48, generated per issuance, and used **only
+      for Consumed Inventory** - stock issued to an office for its own internal use. A RIS starts
+      as a Draft (what an office is requesting); **Issue** confirms the actual quantity released
+      and deducts it from that item's Stock Card/Ledger Card in the same step, always recording it
+      as Consumed by the requesting office/department. An issued RIS can be reversed (restoring
+      the stock and returning it to Draft) if it was issued in error.
+    - **RSMI (Report of Supplies and Materials Issued)** - Appendix 40, generated on demand for
+      any date range: pulls every issued RIS line in that range and recaps it by Stock No.,
+      matching the official form and its recapitulation section exactly. This *is* Consumed
+      Inventory's report - Acknowledgement Receipts don't have an equivalent recap document, which
+      is why Distributed Inventory keeps its own separate "Report" sub-item below.
+  - **Distributed Inventory** expands to **Acknowledgement Receipt** and **Report**:
+    - **Acknowledgement Receipt (AR)** - used **only for Distributed Inventory** - stock given out
+      to a barangay, beneficiary, or the public. There's no official COA form for this (no
+      reference was available to match), so it was designed to follow standard LGU
+      distribution-record practice: Recipient name and Barangay/Address, a Purpose, an item table
+      (Stock No./Description/Unit/Qty Requested/Qty Issued), and three signature blocks (Released
+      by / Received by / Witnessed by). It follows the same Draft -> **Issue** -> reverse lifecycle
+      as RIS: Issue deducts stock and records it as Distributed to that recipient; an issued AR can
+      likewise be reversed if issued in error.
+    - **Report** - the Distributed Inventory issuance report, filterable by date range and search,
+      with running totals and its own CSV export - pulls every issued Acknowledgement Receipt line
+      and additionally shows who/where each item went.
 - **Reconciliation** - paste or upload a Trial Balance (Excel/CSV) and compare it, account by
   account, against the Inventory Registry's own running balance for that account - OK/CHECK pills,
   the same pattern as PMS's own Reconciliation tab.
@@ -125,18 +130,23 @@ redeploys automatically within a minute or two.
 
 Sign in with the account you created in Step 2. The sidebar defaults to **General Fund** - use the
 switcher to add items under Special Education Fund or Trust Fund whenever needed. Add your first
-items under **Inventory Registry**, then use **RIS** to record issuances consumed internally by an
-office, or **Acknowledgement Receipt** to record issuances distributed to a barangay, beneficiary,
-or the public.
+items under **Inventory Registry**, then click **Consumed Inventory** in the sidebar to expand it
+and use **RIS** to record issuances consumed internally by an office, or click **Distributed
+Inventory** to expand it and use **Acknowledgement Receipt** to record issuances distributed to a
+barangay, beneficiary, or the public.
 
 ---
 
 ## Repo structure
 
-- `index.html` - sign-in screen + app shell (no framework, plain DOM). Loads SheetJS (`xlsx`, from
-  cdnjs) for the Reconciliation Excel-upload feature.
-- `css/styles.css` - light/dark-aware design system: sidebar with the Fund switcher and nav,
-  cards, tables, modals, and a separate print stylesheet for the four official forms.
+- `index.html` - sign-in screen + app shell (no framework, plain DOM). The sidebar nav has two
+  expandable groups - **Consumed Inventory** (RIS / RSMI) and **Distributed Inventory**
+  (Acknowledgement Receipt / Report) - click a group's heading to expand or collapse it; the group
+  containing whatever tab you're on expands automatically. Loads SheetJS (`xlsx`, from cdnjs) for
+  the Reconciliation Excel-upload feature.
+- `css/styles.css` - light/dark-aware design system: sidebar with the Fund switcher, the nav's two
+  expandable groups, cards, tables, modals, and a separate print stylesheet for the five printed
+  forms (Supplies Ledger Card, Stock Card, RIS, RSMI, Acknowledgement Receipt).
 - `js/firebase-config.js` - your project's own web config (paste in Step 3 above).
 - `js/firebase.js` - Firebase Auth helpers (sign-in, Google sign-in, password reset/change) and a
   thin Firestore adapter matching the exact `collection().doc().set()/.update()/.delete()/
