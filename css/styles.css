@@ -218,6 +218,16 @@ nav button.active { background: var(--accent-soft); color: var(--ink); font-weig
 nav button.active .ico { color: var(--accent); }
 nav button[hidden] { display: none; }
 
+.nav-group { display: flex; flex-direction: column; }
+.nav-group[hidden] { display: none; }
+.nav-group-toggle .caret { margin-left: auto; font-size: 9px; color: var(--ink-dim); transition: transform .15s ease; }
+.nav-group.open .nav-group-toggle .caret { transform: rotate(180deg); }
+.nav-group-toggle.active-parent { color: var(--ink); font-weight: 600; }
+.nav-group-toggle.active-parent .ico { color: var(--accent); }
+.nav-subitems { display: none; flex-direction: column; gap: 2px; padding-left: 24px; margin: 0 0 2px; }
+.nav-group.open .nav-subitems { display: flex; }
+.nav-subitems button { font-size: 12.5px; padding: 7px 10px; }
+
 .auth-chip {
   display: flex;
   flex-wrap: wrap;
