@@ -1,7 +1,7 @@
 // Firebase Auth + Firestore adapter.
 // Loaded as an ES module. Uses the Firebase v10 modular CDN build so nothing needs npm-installing
 // to run the app itself (only the seed scripts, which run under Node, need `npm install`).
-import { firebaseConfig } from "./firebase-config.js";
+import { firebaseConfig, allowedEmailDomains } from "./firebase-config.js";
 import {
   initializeApp,
 } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-app.js";
@@ -10,6 +10,8 @@ import {
   onAuthStateChanged,
   signInWithEmailAndPassword,
   signInWithPopup,
+  signInWithRedirect,
+  getRedirectResult,
   GoogleAuthProvider,
   signOut as fbSignOut,
   sendPasswordResetEmail,
@@ -40,8 +42,38 @@ export function signInEmail(email, password) {
   return signInWithEmailAndPassword(auth, email, password);
 }
 
+// Google sign-in. Tries a popup first (fastest, keeps the page state); if the browser blocks it
+// - phone browsers and in-app webviews routinely do - it falls back to a full-page redirect,
+// whose result is picked up by completeGoogleRedirect() when the page loads again.
+const POPUP_FALLBACK_CODES = [
+  "auth/popup-blocked",
+  "auth/cancelled-popup-request",
+  "auth/operation-not-supported-in-this-environment",
+];
 export function signInGoogle() {
-  return signInWithPopup(auth, new GoogleAuthProvider());
+  const provider = new GoogleAuthProvider();
+  provider.setCustomParameters({ prompt: "select_account" });
+  return signInWithPopup(auth, provider).catch((err) => {
+    if (POPUP_FALLBACK_CODES.includes((err && err.code) || "")) {
+      return signInWithRedirect(auth, provider);
+    }
+    throw err;
+  });
+}
+
+// Call once on load: resolves with the signed-in result after a redirect round-trip, or null.
+export function completeGoogleRedirect() {
+  return getRedirectResult(auth);
+}
+
+// Optional guard. `allowedEmailDomains` is empty by default, which allows any account the Firebase
+// project itself accepts (the behaviour before Google sign-in existed). Fill it in to restrict
+// who can get in once Google sign-in is enabled - see README, "Google sign-in".
+export function isAllowedAccount(user) {
+  const list = Array.isArray(allowedEmailDomains) ? allowedEmailDomains.filter(Boolean) : [];
+  if (!list.length) return true;
+  const email = ((user && user.email) || "").toLowerCase();
+  return list.some((d) => email.endsWith("@" + String(d).toLowerCase().replace(/^@/, "")));
 }
 
 export function signOut() {
