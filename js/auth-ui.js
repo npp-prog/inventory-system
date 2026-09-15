@@ -20,7 +20,9 @@ function friendlyAuthError(err) {
     return "Google sign-in isn't switched on for this project yet. In the Firebase console open Authentication -> Sign-in method and enable Google.";
   }
   if (code.includes("unauthorized-domain")) {
-    return "This site's web address isn't on the Firebase allow-list yet. In the Firebase console open Authentication -> Settings -> Authorized domains and add this site's domain.";
+    // Nothing to do with which email address is being used - Firebase is refusing the WEBSITE.
+    const host = (typeof location !== "undefined" && location.hostname) || "this site";
+    return `Google sign-in is blocked for this website, not for your account. Add "${host}" in the Firebase console under Authentication -> Settings -> Authorized domains, then try again.`;
   }
   if (code.includes("account-exists-with-different-credential")) {
     return "That email already signs in with a password here. Use the email and password form above instead.";
