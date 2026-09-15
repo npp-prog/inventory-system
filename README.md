@@ -18,20 +18,28 @@ the two registers' data and billing stay independent.
   view: Receipt Qty, Issue Qty + Office, Balance Qty). Recording a new item lets you enter its
   opening balance directly (for onboarding what's already on the shelf) or add stock later as a
   dated Receipt.
-- **RIS (Requisition and Issue Slip)** - Appendix 48, generated per issuance. A RIS starts as a
-  Draft (what an office is requesting); **Issue** confirms the actual quantity released, deducts
-  it from that item's Stock Card/Ledger Card in the same step, and classifies each line as
-  **Consumed** (used internally by an office) or **Distributed** (given out to a barangay,
-  beneficiary, or the public) - defaulting from the item's own account (the `... for Distribution`
-  UACS accounts default to Distributed; the plain `... Inventory` accounts default to Consumed),
-  editable per line, with a Recipient/Barangay field for a Distributed line. An issued RIS can be
-  reversed (restoring the stock and returning it to Draft) if it was issued in error.
+- **RIS (Requisition and Issue Slip)** - Appendix 48, generated per issuance, and used **only for
+  Consumed Inventory** - stock issued to an office for its own internal use. A RIS starts as a
+  Draft (what an office is requesting); **Issue** confirms the actual quantity released and
+  deducts it from that item's Stock Card/Ledger Card in the same step, always recording it as
+  Consumed by the requesting office/department. An issued RIS can be reversed (restoring the stock
+  and returning it to Draft) if it was issued in error.
+- **Acknowledgement Receipt (AR)** - used **only for Distributed Inventory** - stock given out to
+  a barangay, beneficiary, or the public. There's no official COA form for this (no reference was
+  available to match), so it was designed to follow standard LGU distribution-record practice:
+  Recipient name and Barangay/Address, a Purpose, an item table (Stock No./Description/Unit/Qty
+  Requested/Qty Issued), and three signature blocks (Released by / Received by / Witnessed by). It
+  follows the same Draft -> **Issue** -> reverse lifecycle as RIS: Issue deducts stock and records
+  it as Distributed to that recipient; an issued AR can likewise be reversed if issued in error.
 - **RSMI (Report of Supplies and Materials Issued)** - Appendix 40, generated on demand for any
   date range: pulls every issued RIS line in that range and recaps it by Stock No., matching the
-  official form and its recapitulation section exactly.
+  official form and its recapitulation section exactly. (RSMI recaps RIS/Consumed issuances only,
+  matching the official form's scope - Acknowledgement Receipts don't have an equivalent recap
+  report.)
 - **Consumed Inventory** / **Distributed Inventory** - the two issuance reports the office asked
   for as their own tabs, each filterable by date range and search, with running totals and its own
-  CSV export - Distributed additionally shows who/where each item went.
+  CSV export. Consumed pulls every issued RIS line; Distributed pulls every issued Acknowledgement
+  Receipt line and additionally shows who/where each item went.
 - **Reconciliation** - paste or upload a Trial Balance (Excel/CSV) and compare it, account by
   account, against the Inventory Registry's own running balance for that account - OK/CHECK pills,
   the same pattern as PMS's own Reconciliation tab.
@@ -117,7 +125,9 @@ redeploys automatically within a minute or two.
 
 Sign in with the account you created in Step 2. The sidebar defaults to **General Fund** - use the
 switcher to add items under Special Education Fund or Trust Fund whenever needed. Add your first
-items under **Inventory Registry**, then use **RIS** to record issuances.
+items under **Inventory Registry**, then use **RIS** to record issuances consumed internally by an
+office, or **Acknowledgement Receipt** to record issuances distributed to a barangay, beneficiary,
+or the public.
 
 ---
 
@@ -133,8 +143,9 @@ items under **Inventory Registry**, then use **RIS** to record issuances.
   .onSnapshot()` shape `app.js` expects.
 - `js/auth-ui.js` - wires the sign-in form, Google sign-in button, forgot-password link.
 - `js/main.js` - watches Firebase auth state, shows/hides the sign-in screen vs. the app.
-- `js/app.js` - the whole system: item/ledger engine, RIS/RSMI, Consumed/Distributed reports,
-  Reconciliation, Access Role, printable Appendix 9/40/48/53 forms. All functions referenced from
+- `js/app.js` - the whole system: item/ledger engine, RIS/RSMI (Consumed), Acknowledgement Receipt
+  (Distributed), Consumed/Distributed reports, Reconciliation, Access Role, printable Appendix
+  9/40/48/53 forms plus the Acknowledgement Receipt form. All functions referenced from
   inline `onclick=""` HTML are attached to `window` at the very bottom of the file (this app runs
   as an ES module, so module-scope names aren't global the way they are in a classic `<script>`) -
   **remember to add any new inline-onclick function to that block**.
@@ -154,8 +165,11 @@ Inventory (asset-side, UACS `104xx`) and their suggested default expense account
 `50203xxx`) are both defined in `js/app.js`'s `ACCOUNT_CATALOG` - taken directly from your own
 Chart of Accounts tab and Consumption summary. Every account is always editable per item; nothing
 here is enforced beyond being a sensible default when you add a new item. Accounts whose name ends
-"... for Distribution" are the ones whose issuances default to **Distributed**; every other
-Inventory account defaults to **Consumed**.
+"... for Distribution" are shown with a **Distributed** label in the Inventory Registry as an
+informational default (matching how the account is typically used); every other Inventory account
+is labeled **Consumed**. This label is display-only - what actually determines Consumed vs.
+Distributed is which document you issue the item through: **RIS always records Consumed**,
+**Acknowledgement Receipt always records Distributed**, regardless of the item's account.
 
 ## If you want the same hands-on deployment help you had with PMS
 
