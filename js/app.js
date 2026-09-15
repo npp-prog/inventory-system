@@ -227,8 +227,16 @@ function applyAccessControlToNav() {
     b.hidden = !ok;
     if (!ok && S.view === v) hidAny = true;
   });
+  // Hide an entire Consumed/Distributed Inventory group (RIS/RSMI/Report, or Acknowledgement
+  // Receipt/Report) when every one of its sub-items is inaccessible - otherwise an empty,
+  // unclickable group heading would be left dangling in the sidebar.
+  document.querySelectorAll("#mainNav .nav-group").forEach((g) => {
+    const anyVisible = [...g.querySelectorAll("button[data-view]")].some((b) => !b.hidden);
+    g.hidden = !anyVisible;
+  });
   if (hidAny) {
-    const firstVisible = document.querySelector("#mainNav button[data-view]:not([hidden])");
+    const firstVisible = [...document.querySelectorAll("#mainNav button[data-view]:not([hidden])")]
+      .find((b) => !b.closest(".nav-group[hidden]"));
     if (firstVisible) setView(firstVisible.dataset.view);
   }
 }
@@ -1862,9 +1870,18 @@ function renderAll() {
 }
 function setView(view) {
   S.view = view;
-  document.querySelectorAll("#mainNav button").forEach((b) => b.classList.toggle("active", b.dataset.view === view));
+  document.querySelectorAll("#mainNav button[data-view]").forEach((b) => b.classList.toggle("active", b.dataset.view === view));
   document.querySelectorAll(".view").forEach((v) => v.classList.toggle("active", v.id === "view-" + view));
   document.getElementById("viewTitle").textContent = VIEW_TITLES[view] || view;
+  // RIS/RSMI/Report live under the Consumed Inventory group, and Acknowledgement Receipt/Report
+  // live under Distributed Inventory - open (but don't force-close) whichever group contains the
+  // view being switched to, and bold its heading while one of its sub-items is active.
+  document.querySelectorAll("#mainNav .nav-group").forEach((g) => {
+    const isCurrentGroup = !!g.querySelector(`button[data-view="${view}"]`);
+    if (isCurrentGroup) g.classList.add("open");
+    const toggle = g.querySelector(".nav-group-toggle");
+    if (toggle) toggle.classList.toggle("active-parent", isCurrentGroup);
+  });
 }
 function renderFundSwitch() {
   document.getElementById("fundSwitch").innerHTML = FUNDS.map((f) => `
@@ -1882,6 +1899,9 @@ function setFund(code) {
 function bindStaticUI() {
   document.querySelectorAll("#mainNav button[data-view]").forEach((b) => {
     b.addEventListener("click", () => setView(b.dataset.view));
+  });
+  document.querySelectorAll("#mainNav .nav-group-toggle").forEach((b) => {
+    b.addEventListener("click", () => b.closest(".nav-group").classList.toggle("open"));
   });
   document.getElementById("signOutBtn").addEventListener("click", () => signOut());
   document.getElementById("changePasswordBtn").addEventListener("click", () => openChangePasswordModal());
