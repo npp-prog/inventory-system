@@ -51,13 +51,30 @@
     <nav id="mainNav">
       <button data-view="dashboard"><span class="ico">01</span> Dashboard</button>
       <button data-view="registry"><span class="ico">02</span> Inventory Registry</button>
-      <button data-view="ris"><span class="ico">03</span> RIS</button>
-      <button data-view="rsmi"><span class="ico">04</span> RSMI</button>
-      <button data-view="ar"><span class="ico">05</span> Acknowledgement Receipt</button>
-      <button data-view="consumed"><span class="ico">06</span> Consumed Inventory</button>
-      <button data-view="distributed"><span class="ico">07</span> Distributed Inventory</button>
-      <button data-view="reconciliation"><span class="ico">08</span> Reconciliation</button>
-      <button data-view="users"><span class="ico">09</span> Users &amp; Roles</button>
+
+      <div class="nav-group" data-group="consumed">
+        <button class="nav-group-toggle" data-toggle="consumed" type="button">
+          <span class="ico">03</span> Consumed Inventory <span class="caret">&#9662;</span>
+        </button>
+        <div class="nav-subitems">
+          <button data-view="ris">RIS</button>
+          <button data-view="rsmi">RSMI</button>
+          <button data-view="consumed">Report</button>
+        </div>
+      </div>
+
+      <div class="nav-group" data-group="distributed">
+        <button class="nav-group-toggle" data-toggle="distributed" type="button">
+          <span class="ico">04</span> Distributed Inventory <span class="caret">&#9662;</span>
+        </button>
+        <div class="nav-subitems">
+          <button data-view="ar">Acknowledgement Receipt</button>
+          <button data-view="distributed">Report</button>
+        </div>
+      </div>
+
+      <button data-view="reconciliation"><span class="ico">05</span> Reconciliation</button>
+      <button data-view="users"><span class="ico">06</span> Users &amp; Roles</button>
     </nav>
 
     <div class="auth-chip">
