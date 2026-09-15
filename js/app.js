@@ -72,10 +72,11 @@ export const RETIRE_REASONS = [
 
 const HARDCODED_ADMIN_EMAILS = ["npp@mgocandoniaccounting.org"];
 const EDITABLE_TABS = ["registry", "air", "ris", "rsmi", "reconciliation"];
-const VIEW_ONLY_TABS = ["dashboard", "issued"];
+const VIEW_ONLY_TABS = ["dashboard", "medicines", "issued"];
 const VIEW_TITLES = {
   dashboard: "Dashboard",
   registry: "Inventory Registry",
+  medicines: "Medicines - Health Unit",
   air: "Acceptance and Inspection Report (AIR)",
   ris: "Requisition and Issue Slip (RIS)",
   rsmi: "Report of Supplies and Materials Issued (RSMI)",
@@ -94,6 +95,28 @@ const ISSUE_TYPES = [
 function issueTypeInfo(code) { return ISSUE_TYPES.find((t) => t.code === code) || ISSUE_TYPES[0]; }
 function issueTypeLabel(code) { return issueTypeInfo(code).label; }
 
+// Health Unit medicines. These are ordinary registry items - the Medicines tab is a filtered
+// view of the same data, not a separate register - but they are the only items that carry batch
+// numbers and expiry dates on receipt, and the only ones the expiry warnings apply to.
+// Deliberately just 10404060 (Drugs and Medicines Inventory); widen this list if the RHU later
+// wants Medical/Dental/Laboratory Supplies or the "for Distribution" medicines counted too.
+const MEDICINE_ACCOUNTS = ["10404060"];
+function isMedicineAccount(code) { return MEDICINE_ACCOUNTS.includes(String(code || "")); }
+const NEAR_EXPIRY_DAYS = 90;
+function daysUntil(dateStr) {
+  if (!dateStr) return null;
+  const t = new Date(dateStr + "T00:00:00").getTime();
+  if (isNaN(t)) return null;
+  return Math.round((t - new Date(todayStr() + "T00:00:00").getTime()) / 86400000);
+}
+function expiryPillHtml(dateStr) {
+  const d = daysUntil(dateStr);
+  if (d == null) return "";
+  if (d < 0) return `<span class="pill check">Expired ${Math.abs(d)}d ago</span>`;
+  if (d <= NEAR_EXPIRY_DAYS) return `<span class="pill check">Expires in ${d}d</span>`;
+  return `<span class="pill ok">OK</span>`;
+}
+
 // ---------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------
@@ -110,6 +133,7 @@ const S = {
   userRoles: new Map(),
   registryFilter: { q: "", account: "", disposition: "", status: "with_balance" },
   airFilter: { q: "", status: "" },
+  medicinesFilter: { q: "" },
   risFilter: { q: "", status: "", type: "" },
   issuedFilter: { q: "", from: "", to: "", type: "" },
   reconPeriod: null,
@@ -545,7 +569,9 @@ function airHtml(r) {
   const lines = r.lines || [];
   const rows = lines.map((l) => `
     <tr>
-      <td>${esc(l.stock_no)}</td><td>${esc(l.description)}</td><td class="center">${esc(l.unit)}</td>
+      <td>${esc(l.stock_no)}</td>
+      <td>${esc(l.description)}${l.batch_no || l.expiry_date ? ` <i>(${[l.batch_no ? "Batch " + esc(l.batch_no) : "", l.expiry_date ? "exp. " + fmtDate(l.expiry_date) : ""].filter(Boolean).join(", ")})</i>` : ""}</td>
+      <td class="center">${esc(l.unit)}</td>
       <td class="right">${fmtNum(l.qty)}</td>
     </tr>`).join("");
   const pad = Math.max(0, 16 - lines.length);
@@ -855,7 +881,7 @@ function openItemDetail(id) {
     <tr${r.air_id || r.ris_id ? ` class="clickable" onclick="closeModal();${r.air_id ? `openAirDetail('${r.air_id}')` : `openRisDetail('${r.ris_id}')`}"` : ""}>
       <td>${fmtDate(r.date)}</td><td>${esc(r.ref || "")}</td>
       <td>${r.type === "receipt" ? '<span class="pill ok">Receipt</span>' : `<span class="pill ${r.disposition === "distributed" ? "distributed" : "consumed"}">${r.disposition === "distributed" ? "Distribution" : "Consumption"}</span>`}</td>
-      <td class="num">${r.type === "receipt" ? "+" : "-"}${fmtNum(r.qty)}</td>
+      <td class="num">${r.type === "receipt" ? "+" : "-"}${fmtNum(r.qty)}${r.batch_no || r.expiry_date ? `<div class="small">${esc(r.batch_no || "")}${r.expiry_date ? " &middot; exp. " + fmtDate(r.expiry_date) : ""}</div>` : ""}</td>
       <td class="num">${fmtNum(r.unit_cost)}</td>
       <td class="num">${fmtMoney(r.total_cost)}</td>
       <td class="num">${fmtNum(r.run_qty)}</td>
@@ -902,6 +928,140 @@ function exportRegistryCsv() {
   }
   browserDownload(`Inventory_Registry_${S.currentFund}_${todayStr()}.csv`, lines.join("\n"), "text/csv");
 }
+
+// ---------------------------------------------------------------------
+// Medicines - Health Unit. A filtered view of the same registry/AIR/RIS data, not a separate
+// register: it shows only items on the Drugs and Medicines Inventory account (MEDICINE_ACCOUNTS),
+// with the batch numbers and expiry dates their deliveries carry, and flags anything expired or
+// expiring within NEAR_EXPIRY_DAYS.
+// ---------------------------------------------------------------------
+
+function medicineItems(fund) {
+  return [...S.items.values()]
+    .filter((a) => a.fund === fund && a.status !== "discontinued" && isMedicineAccount(a.account_code))
+    .sort((a, b) => (a.description || "").localeCompare(b.description || ""));
+}
+
+// Every batch ever received for a medicine item, newest expiry problems first.
+function medicineBatches(fund) {
+  const out = [];
+  for (const a of medicineItems(fund)) {
+    for (const e of a.ledger || []) {
+      if (e.type !== "receipt") continue;
+      out.push({ item: a, entry: e, days: daysUntil(e.expiry_date) });
+    }
+  }
+  out.sort((x, y) => {
+    const dx = x.days == null ? Infinity : x.days;
+    const dy = y.days == null ? Infinity : y.days;
+    return dx - dy;
+  });
+  return out;
+}
+
+function earliestExpiry(item) {
+  const dates = (item.ledger || []).filter((e) => e.type === "receipt" && e.expiry_date).map((e) => e.expiry_date).sort();
+  return dates[0] || "";
+}
+
+function renderMedicines() {
+  const saved = captureFocus("view-medicines");
+  const fund = S.currentFund;
+  const q = (S.medicinesFilter.q || "").toLowerCase();
+  const match = (a) => !q || [a.stock_no, a.description, a.item].some((v) => (v || "").toLowerCase().includes(q));
+  const items = medicineItems(fund).filter(match);
+  const onHand = items.filter((a) => Math.abs(qtyBalance(a)) > 1e-9);
+  const batches = medicineBatches(fund).filter((b) => match(b.item));
+  const expired = batches.filter((b) => b.days != null && b.days < 0);
+  const nearExpiry = batches.filter((b) => b.days != null && b.days >= 0 && b.days <= NEAR_EXPIRY_DAYS);
+  const noExpiry = batches.filter((b) => b.days == null);
+  const totalValue = onHand.reduce((s, a) => s + costBalance(a), 0);
+
+  // Issuances of medicine items, newest first.
+  const issues = [];
+  for (const a of items) {
+    for (const e of a.ledger || []) {
+      if (e.type === "issue") issues.push({ item: a, entry: e });
+    }
+  }
+  issues.sort((x, y) => (y.entry.date || "").localeCompare(x.entry.date || ""));
+
+  document.getElementById("view-medicines").innerHTML = `
+    <div class="panel small">Everything on the <b>Drugs and Medicines Inventory (10404060)</b> account, filtered out of the main registry. Stock arrives through <b>Acceptance</b> (where each delivery records its Batch No. and Expiry) and leaves through a <b>RIS</b>, exactly like any other item - this view just puts the Health Unit's medicines, their batches and their expiry dates in one place.</div>
+    <div class="toolbar">
+      <input class="grow" id="medSearch" placeholder="Search medicine name or stock no..." value="${esc(S.medicinesFilter.q)}"/>
+      <div class="toolbar-right"><button class="btn" onclick="exportMedicinesCsv()">Download CSV</button></div>
+    </div>
+    <div class="cardrow">
+      <div class="card"><div class="label">Medicines on hand</div><div class="value">${onHand.length}</div><div class="foot">${esc(fundLabel(fund))}</div></div>
+      <div class="card"><div class="label">Stock value</div><div class="value">${fmtMoney(totalValue)}</div><div class="foot">at running average cost</div></div>
+      <div class="card ${nearExpiry.length ? "warn" : ""}"><div class="label">Expiring in ${NEAR_EXPIRY_DAYS} days</div><div class="value">${nearExpiry.length}</div><div class="foot">batch(es) to use or endorse first</div></div>
+      <div class="card ${expired.length ? "warn" : ""}"><div class="label">Expired</div><div class="value">${expired.length}</div><div class="foot">batch(es) past their expiry date</div></div>
+    </div>
+
+    <div class="panel">
+      <h3>Medicine stock</h3>
+      ${onHand.length ? `<div class="table-wrap"><table>
+        <thead><tr><th>Stock No.</th><th>Medicine</th><th class="num">Balance</th><th class="num">Value</th><th>Earliest expiry</th></tr></thead>
+        <tbody>${onHand.map((a) => {
+          const exp = earliestExpiry(a);
+          return `<tr class="clickable" onclick="openItemDetail('${a.id}')">
+            <td>${esc(a.stock_no)}</td>
+            <td>${esc(a.description)}${isLowStock(a) ? ' <span class="pill check">Low stock</span>' : ""}</td>
+            <td class="num">${fmtNum(qtyBalance(a))} ${esc(a.unit || "")}</td>
+            <td class="num">${fmtMoney(costBalance(a))}</td>
+            <td>${exp ? fmtDate(exp) + " " + expiryPillHtml(exp) : '<span class="small">not recorded</span>'}</td>
+          </tr>`;
+        }).join("")}</tbody></table></div>` : `<div class="empty">No medicines on hand in ${esc(fundLabel(fund))}.</div>`}
+    </div>
+
+    <div class="panel">
+      <h3>Batches received <span class="small" style="font-weight:normal;">(soonest expiry first)</span></h3>
+      ${batches.length ? `<div class="table-wrap"><table>
+        <thead><tr><th>Expiry</th><th>Batch No.</th><th>Stock No.</th><th>Medicine</th><th class="num">Qty received</th><th>AIR No.</th><th>Supplier</th><th>Date received</th></tr></thead>
+        <tbody>${batches.map((b) => `<tr class="clickable" onclick="${b.entry.air_id ? `openAirDetail('${b.entry.air_id}')` : `openItemDetail('${b.item.id}')`}">
+          <td>${b.entry.expiry_date ? fmtDate(b.entry.expiry_date) + " " + expiryPillHtml(b.entry.expiry_date) : '<span class="small">not recorded</span>'}</td>
+          <td>${esc(b.entry.batch_no || "")}</td>
+          <td>${esc(b.item.stock_no)}</td>
+          <td>${esc(b.item.description)}</td>
+          <td class="num">${fmtNum(b.entry.qty)} ${esc(b.item.unit || "")}</td>
+          <td>${esc(b.entry.ref || "")}</td>
+          <td>${esc(b.entry.supplier || "")}</td>
+          <td>${fmtDate(b.entry.date)}</td>
+        </tr>`).join("")}</tbody></table></div>
+        ${noExpiry.length ? `<p class="small">${noExpiry.length} batch(es) have no expiry date recorded - add it on the Acceptance line when the delivery is entered.</p>` : ""}`
+        : `<div class="empty">No medicine deliveries recorded yet.</div>`}
+    </div>
+
+    <div class="panel">
+      <h3>Medicines issued</h3>
+      ${issues.length ? `<div class="table-wrap"><table>
+        <thead><tr><th>Date</th><th>RIS No.</th><th>Type</th><th>Medicine</th><th class="num">Qty</th><th class="num">Amount</th><th>Office / Recipient</th></tr></thead>
+        <tbody>${issues.slice(0, 50).map((r) => `<tr class="clickable" onclick="${r.entry.ris_id ? `openRisDetail('${r.entry.ris_id}')` : `openItemDetail('${r.item.id}')`}">
+          <td>${fmtDate(r.entry.date)}</td><td>${esc(r.entry.ref || "")}</td>
+          <td><span class="pill ${r.entry.disposition === "distributed" ? "distributed" : "consumed"}">${r.entry.disposition === "distributed" ? "Distribution" : "Consumption"}</span></td>
+          <td>${esc(r.item.description)}</td>
+          <td class="num">${fmtNum(r.entry.qty)} ${esc(r.item.unit || "")}</td>
+          <td class="num">${fmtMoney(r.entry.total_cost)}</td>
+          <td>${esc(r.entry.recipient || r.entry.office || "")}</td>
+        </tr>`).join("")}</tbody></table></div>` : `<div class="empty">No medicines issued yet.</div>`}
+    </div>`;
+  document.getElementById("medSearch").addEventListener("input", (e) => { S.medicinesFilter.q = e.target.value; renderMedicines(); });
+  restoreFocus(saved);
+}
+
+function exportMedicinesCsv() {
+  const fund = S.currentFund;
+  const header = ["Stock No.", "Medicine", "Unit", "Balance Qty", "Balance Value", "Batch No.", "Expiry", "Days to expiry", "Qty received", "AIR No.", "Supplier", "Date received"];
+  const lines = [header.join(",")];
+  for (const b of medicineBatches(fund)) {
+    lines.push([b.item.stock_no, b.item.description, b.item.unit, qtyBalance(b.item), costBalance(b.item).toFixed(2),
+      b.entry.batch_no || "", b.entry.expiry_date || "", b.days == null ? "" : b.days,
+      b.entry.qty, b.entry.ref || "", b.entry.supplier || "", b.entry.date].map(csvField).join(","));
+  }
+  browserDownload(`Medicines_HealthUnit_${fund}_${todayStr()}.csv`, lines.join("\n"), "text/csv");
+}
+
 
 // ---------------------------------------------------------------------
 // RIS - Requisition and Issue Slip. The single issuance document in the system: every release of
@@ -1447,18 +1607,62 @@ function renderAir() {
   restoreFocus(saved);
 }
 
+// The item picker on an AIR line searches the registry by EITHER stock code or item name: the
+// datalist option's value holds both ("OS-0001 — Bond Paper A4"), and browsers substring-match
+// that value, so typing "OS-00" or "bond" both narrow it. Whatever is typed that doesn't resolve
+// to a registry item is treated as a brand-new stock code, which posting will create.
+function airItemLabel(a) { return `${a.stock_no} — ${a.description}`; }
+function parseStockInput(raw) {
+  const s = String(raw || "").trim();
+  const i = s.indexOf(" — ");
+  return i > 0 ? s.slice(0, i).trim() : s;
+}
+function airItemDatalistHtml(fund) {
+  return `<datalist id="airItemList">${activeItems(fund)
+    .sort((a, b) => (a.stock_no || "").localeCompare(b.stock_no || ""))
+    .map((a) => `<option value="${esc(airItemLabel(a))}">${esc(a.unit || "")} &middot; on hand ${fmtNum(qtyBalance(a))}</option>`)
+    .join("")}</datalist>`;
+}
+
 function airLineRowHtml(l, idx) {
   const known = itemByStockNo(S.currentFund, l.stock_no);
+  const shown = known ? airItemLabel(known) : (l.stock_no || "");
+  const med = isMedicineAccount(l.account_code || (known && known.account_code));
   return `<tr data-idx="${idx}">
-    <td><input class="air_line_stockno" data-idx="${idx}" value="${esc(l.stock_no || "")}" placeholder="Stock/Property No."/>
-      <div class="small air_line_hint" data-idx="${idx}">${known ? "in registry: " + esc(known.description) : ""}</div></td>
+    <td><input class="air_line_stockno" data-idx="${idx}" list="airItemList" value="${esc(shown)}" placeholder="Search code or item name, or type a new code"/>
+      <div class="small air_line_hint" data-idx="${idx}">${known ? "in registry &middot; on hand " + fmtNum(qtyBalance(known)) + " " + esc(known.unit || "") : (l.stock_no ? "new stock code - a new registry item will be created" : "")}</div></td>
     <td><input class="air_line_desc" data-idx="${idx}" value="${esc(l.description || "")}"/></td>
     <td><input class="air_line_unit" data-idx="${idx}" value="${esc(l.unit || "")}" style="width:70px;"/></td>
-    <td><input class="air_line_qty" data-idx="${idx}" type="number" step="0.01" value="${l.qty || 0}"/></td>
-    <td><input class="air_line_unitcost" data-idx="${idx}" type="number" step="0.01" value="${l.unit_cost || 0}"/></td>
+    <td><input class="air_line_qty" data-idx="${idx}" type="number" step="0.01" value="${l.qty || 0}" style="width:80px;"/></td>
+    <td><input class="air_line_unitcost" data-idx="${idx}" type="number" step="0.01" value="${l.unit_cost || 0}" style="width:90px;"/></td>
     <td><select class="air_line_account" data-idx="${idx}">${accountOptionsHtml(l.account_code || (known && known.account_code))}</select></td>
     <td><button class="btn ghost" onclick="removeAirLine(${idx})">✕</button></td>
+  </tr>
+  <tr class="air_line_extra" data-idx="${idx}" ${med ? "" : "hidden"}>
+    <td colspan="7" style="background:var(--accent-soft);">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+        <span class="small"><b>Health Unit medicine</b> - record the batch and expiry:</span>
+        <label style="margin:0;" class="small">Batch / Lot No.
+          <input class="air_line_batch" data-idx="${idx}" value="${esc(l.batch_no || "")}" style="width:130px;"/></label>
+        <label style="margin:0;" class="small">Expiry date
+          <input class="air_line_expiry" data-idx="${idx}" type="date" value="${esc(l.expiry_date || "")}" style="width:160px;"/></label>
+      </div>
+    </td>
   </tr>`;
+}
+
+// Batch no. and expiry only apply to Health Unit medicines, so their sub-row is shown or hidden
+// in place - never by re-rendering the table, which would wipe whatever field is being typed into.
+function syncAirMedicineFields(body, idx, accountCode) {
+  const med = isMedicineAccount(accountCode);
+  const extra = body.querySelector(`.air_line_extra[data-idx="${idx}"]`);
+  if (extra) extra.hidden = !med;
+  if (!med) {
+    for (const cls of ["air_line_batch", "air_line_expiry"]) {
+      const el = body.querySelector(`.${cls}[data-idx="${idx}"]`);
+      if (el) el.value = "";
+    }
+  }
 }
 
 let _airDraftLines = [];
@@ -1495,11 +1699,14 @@ function openAirModal(id) {
         <div><label>Invoice Date</label><input id="air_invdate" type="date" value="${r ? r.inv_date || "" : ""}"/></div>
       </div>
       <div class="hr"></div>
-      <table class="line-table"><thead><tr><th>Stock/Property No.</th><th>Description</th><th>Unit</th><th>Quantity</th><th>Unit Cost</th><th>Inventory account</th><th></th></tr></thead>
-        <tbody id="airLinesBody"></tbody>
-      </table>
+      ${airItemDatalistHtml(S.currentFund)}
+      <div class="table-wrap">
+        <table class="line-table"><thead><tr><th>Item (search code or name)</th><th>Description</th><th>Unit</th><th>Quantity</th><th>Unit Cost</th><th>Inventory account</th><th></th></tr></thead>
+          <tbody id="airLinesBody"></tbody>
+        </table>
+      </div>
       <button class="btn" style="margin-top:8px;" onclick="addAirLine()">+ Add line</button>
-      <p class="small">Unit Cost and the inventory account are not on the printed AIR form - they're captured here because the registry needs them to value the stock once Accounting posts it.</p>
+      <p class="small">Start typing a <b>stock code or item name</b> to pick something already in the registry - anything else you type is treated as a <b>new stock code</b> and becomes a new registry item when Accounting posts this AIR. A line on the <b>Drugs and Medicines (10404060)</b> account opens a batch/expiry row underneath it - that is what feeds the Medicines &middot; RHU tab's expiry warnings. Unit Cost and the inventory account are not on the printed AIR form - they're captured here because the registry needs them to value the stock.</p>
       <div class="hr"></div>
       <div class="grid2">
         <div>
@@ -1530,14 +1737,19 @@ function openAirModal(id) {
     if (idx == null || isNaN(idx)) return;
     const l = _airDraftLines[idx] || (_airDraftLines[idx] = {});
     if (e.target.classList.contains("air_line_stockno")) {
-      l.stock_no = e.target.value.trim();
+      // Accepts either a picked "CODE — Description" suggestion or a freely typed new code.
+      l.stock_no = parseStockInput(e.target.value);
       const known = itemByStockNo(S.currentFund, l.stock_no);
       const hint = body.querySelector(`.air_line_hint[data-idx="${idx}"]`);
-      if (hint) hint.textContent = known ? `in registry: ${known.description}` : "";
+      if (hint) {
+        hint.textContent = known
+          ? `in registry · ${known.description} · on hand ${fmtNum(qtyBalance(known))} ${known.unit || ""}`
+          : (l.stock_no ? "new stock code - a new registry item will be created" : "");
+      }
       if (known) {
-        // Same stock number as something already in the registry: pre-fill the rest of the row
-        // from that item, so this delivery files itself inside it. Patched in place on purpose -
-        // re-rendering the table here would yank away whatever field is being typed into next.
+        // Pre-fill the rest of the row from that item, so this delivery files itself inside it.
+        // Patched in place on purpose - re-rendering the table here would yank away whatever
+        // field is being typed into next.
         const fill = (cls, val) => {
           const el = body.querySelector(`.${cls}[data-idx="${idx}"]`);
           if (el && !el.value) el.value = val || "";
@@ -1549,12 +1761,19 @@ function openAirModal(id) {
           const sel = body.querySelector(`.air_line_account[data-idx="${idx}"]`);
           if (sel) sel.value = known.account_code;
         }
+        syncAirMedicineFields(body, idx, l.account_code);
       }
     } else if (e.target.classList.contains("air_line_desc")) l.description = e.target.value;
     else if (e.target.classList.contains("air_line_unit")) l.unit = e.target.value;
     else if (e.target.classList.contains("air_line_qty")) l.qty = Number(e.target.value) || 0;
     else if (e.target.classList.contains("air_line_unitcost")) l.unit_cost = Number(e.target.value) || 0;
-    else if (e.target.classList.contains("air_line_account")) l.account_code = e.target.value;
+    else if (e.target.classList.contains("air_line_batch")) l.batch_no = e.target.value.trim();
+    else if (e.target.classList.contains("air_line_expiry")) l.expiry_date = e.target.value;
+    else if (e.target.classList.contains("air_line_account")) {
+      l.account_code = e.target.value;
+      if (!isMedicineAccount(l.account_code)) { l.batch_no = ""; l.expiry_date = ""; }
+      syncAirMedicineFields(body, idx, l.account_code);
+    }
   };
   // "input" keeps the draft in step with every keystroke; "change" catches the select.
   body.addEventListener("input", onEdit);
@@ -1570,6 +1789,8 @@ function collectAirLines() {
     qty: Number(l.qty) || 0,
     unit_cost: Number(l.unit_cost) || 0,
     account_code: l.account_code || ACCOUNT_CATALOG[0].code,
+    batch_no: isMedicineAccount(l.account_code) ? (l.batch_no || "") : "",
+    expiry_date: isMedicineAccount(l.account_code) ? (l.expiry_date || "") : "",
   }));
 }
 
@@ -1621,6 +1842,7 @@ function openAirDetail(id) {
       <td class="num">${fmtNum(l.qty)}</td>
       <td class="num">${fmtNum(l.unit_cost)}</td>
       <td class="num">${fmtMoney((Number(l.qty) || 0) * (Number(l.unit_cost) || 0))}</td>
+      <td>${l.batch_no || l.expiry_date ? `${esc(l.batch_no || "")}${l.expiry_date ? `<div class="small">exp. ${fmtDate(l.expiry_date)} ${expiryPillHtml(l.expiry_date)}</div>` : ""}` : ""}</td>
     </tr>`;
   }).join("");
   openModal(`
@@ -1637,9 +1859,9 @@ function openAirDetail(id) {
         <div><b>Invoice No./Date</b><br/>${esc(r.inv_no || "")}${r.inv_date ? " / " + fmtDate(r.inv_date) : ""}</div>
       </div>
       <div class="hr"></div>
-      <div class="table-wrap"><table><thead><tr><th>Stock/Property No.</th><th>Description</th><th>Unit</th><th class="num">Qty</th><th class="num">Unit Cost</th><th class="num">Amount</th></tr></thead>
+      <div class="table-wrap"><table><thead><tr><th>Stock/Property No.</th><th>Description</th><th>Unit</th><th class="num">Qty</th><th class="num">Unit Cost</th><th class="num">Amount</th><th>Batch / Expiry</th></tr></thead>
       <tbody>${rows}</tbody>
-      <tfoot><tr><td colspan="5" class="num"><b>Total</b></td><td class="num"><b>${fmtMoney(airTotal(r))}</b></td></tr></tfoot></table></div>
+      <tfoot><tr><td colspan="5" class="num"><b>Total</b></td><td class="num"><b>${fmtMoney(airTotal(r))}</b></td><td></td></tr></tfoot></table></div>
       <div class="grid2 small" style="margin-top:10px;">
         <div><b>Acceptance</b><br/>${r.acceptance === "partial" ? "Partial" : "Complete"}${r.partial_note ? " - " + esc(r.partial_note) : ""}<br/>Received ${r.date_received ? fmtDate(r.date_received) : "—"} &middot; ${esc(r.custodian_name || "")}</div>
         <div><b>Inspection</b><br/>${r.inspected_ok ? "Inspected, verified and found in order" : "Not yet inspected"}<br/>Inspected ${r.date_inspected ? fmtDate(r.date_inspected) : "—"} &middot; ${esc(r.inspector_name || "")}</div>
@@ -1703,7 +1925,9 @@ function confirmPostAir(id) {
     const entry = {
       id: uid(), type: "receipt", date: r.date_received || r.date,
       ref: r.air_no, qty, unit_cost: Number(l.unit_cost) || 0, total_cost: round2(qty * (Number(l.unit_cost) || 0)),
-      air_id: r.id, supplier: r.supplier || "", by: S.currentUser.email, at: Date.now(),
+      air_id: r.id, supplier: r.supplier || "",
+      batch_no: l.batch_no || "", expiry_date: l.expiry_date || "",
+      by: S.currentUser.email, at: Date.now(),
     };
     const cur = pending.get(key) || { line: l, entries: [] };
     cur.entries.push(entry);
@@ -1764,12 +1988,13 @@ function printAir(id) { openPrintWindow(airHtml(S.air.get(id)), "portrait"); }
 
 function exportAirCsv() {
   const rows = filterAirRows(S.airFilter);
-  const header = ["AIR No.", "Date", "Supplier", "Dept/Office", "PO No.", "Invoice No.", "Status", "Stock/Property No.", "Description", "Unit", "Quantity", "Unit Cost", "Amount"];
+  const header = ["AIR No.", "Date", "Supplier", "Dept/Office", "PO No.", "Invoice No.", "Status", "Stock/Property No.", "Description", "Unit", "Quantity", "Unit Cost", "Amount", "Batch No.", "Expiry"];
   const lines = [header.join(",")];
   for (const r of rows) {
     for (const l of r.lines || []) {
       lines.push([r.air_no, r.date, r.supplier, r.dept_office, r.po_no, r.inv_no, r.status === "posted" ? "In Registry" : "For Accounting",
-        l.stock_no, l.description, l.unit, l.qty, l.unit_cost, round2((Number(l.qty) || 0) * (Number(l.unit_cost) || 0))].map(csvField).join(","));
+        l.stock_no, l.description, l.unit, l.qty, l.unit_cost, round2((Number(l.qty) || 0) * (Number(l.unit_cost) || 0)),
+        l.batch_no || "", l.expiry_date || ""].map(csvField).join(","));
     }
   }
   browserDownload(`AIR_${S.currentFund}_${todayStr()}.csv`, lines.join("\n"), "text/csv");
@@ -2082,7 +2307,7 @@ function saveTbSnapshot() {
 // Users & Roles
 // ---------------------------------------------------------------------
 
-const TAB_KEYS = ["dashboard", "registry", "air", "ris", "rsmi", "issued", "reconciliation"];
+const TAB_KEYS = ["dashboard", "registry", "medicines", "air", "ris", "rsmi", "issued", "reconciliation"];
 function summarizeRestrictions(role) {
   const t = role.tabs || {};
   const parts = [];
@@ -2186,7 +2411,7 @@ function submitChangePassword() {
 // ---------------------------------------------------------------------
 
 const RENDERERS = {
-  dashboard: renderDashboard, registry: renderRegistry, air: renderAir,
+  dashboard: renderDashboard, registry: renderRegistry, medicines: renderMedicines, air: renderAir,
   ris: renderRis, rsmi: renderRsmi, issued: renderIssued,
   reconciliation: renderReconciliation, users: renderUsers,
 };
@@ -2269,6 +2494,7 @@ Object.assign(window, {
   setFund, setView, closeModal, __setTestUser, renderAll,
   openItemModal, saveItem, openItemDetail, discontinueItem, reactivateItem,
   printSlc, printSc, exportRegistryCsv,
+  exportMedicinesCsv,
   openAirModal, saveAir, addAirLine, removeAirLine, openAirDetail, deleteAir,
   openPostAirModal, confirmPostAir, unpostAir, printAir, exportAirCsv,
   openRisModal, saveRis, addRisLine, removeRisLine, openRisDetail, deleteRis,
