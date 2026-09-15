@@ -3,7 +3,8 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Inventory Management System (IMS)</title>
+<title>Inventory Management System (IMS) &middot; MGO Candoni</title>
+<link rel="icon" href="assets/logo.png" />
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400;500;700&display=swap">
 <link rel="stylesheet" href="css/styles.css" />
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
@@ -12,26 +13,28 @@
 
 <div id="signinScreen">
   <div class="signin-card">
-    <div class="seal">
-      <div class="mark">M</div>
-      <h1>Inventory Management System (IMS)</h1>
-      <div class="sub">MGO &middot; Candoni</div>
+    <div class="signin-head">
+      <img class="signin-logo" src="assets/logo.png" alt="Municipality of Candoni" />
+      <div class="signin-gov">Republic of the Philippines</div>
+      <h1>Municipal Government of Candoni</h1>
+      <div class="sub">Negros Occidental</div>
+      <div class="signin-app">Inventory Management System</div>
     </div>
     <div id="signinError" class="err-box" hidden></div>
     <form id="signinForm">
       <label for="signinEmail">Email</label>
-      <input id="signinEmail" type="email" autocomplete="username" required />
+      <input id="signinEmail" type="email" autocomplete="username" placeholder="you@mgocandoniaccounting.org" required />
       <label for="signinPassword">Password</label>
-      <input id="signinPassword" type="password" autocomplete="current-password" required />
-      <button class="btn primary block" style="margin-top:16px;" type="submit">Sign in</button>
+      <input id="signinPassword" type="password" autocomplete="current-password" placeholder="••••••••" required />
+      <button class="btn primary block" style="margin-top:18px;" type="submit">Sign in</button>
     </form>
-    <div class="center small" style="margin-top:10px;">
+    <div class="center small" style="margin-top:12px;">
       <a href="#" id="forgotPasswordLink">Forgot password?</a>
     </div>
-    <div class="hr"></div>
+    <div class="signin-or"><span>or</span></div>
     <button id="googleSigninBtn" class="btn block" type="button">Sign in with Google</button>
-    <p class="small center" style="margin-top:14px;">
-      Accounts are created by your Firebase project administrator &mdash; there is no self-service sign-up.
+    <p class="small center signin-foot">
+      Accounts are created by your system administrator &mdash; there is no self-service sign-up.
     </p>
   </div>
 </div>
@@ -39,11 +42,9 @@
 <div id="appScreen" hidden>
   <aside id="sidebar">
     <div class="brand">
-      <div class="seal">
-        <div class="mark">M</div>
-        <h1>Inventory Management<br/>System (IMS)</h1>
-        <div class="sub">MGO &middot; Candoni</div>
-      </div>
+      <img class="brand-logo" src="assets/logo.png" alt="Municipality of Candoni" />
+      <h1>Inventory Management<br/>System</h1>
+      <div class="sub">MGO &middot; Candoni</div>
     </div>
 
     <div id="fundSwitch"></div>
@@ -51,24 +52,16 @@
     <nav id="mainNav">
       <button data-view="dashboard"><span class="ico">01</span> Dashboard</button>
       <button data-view="registry"><span class="ico">02</span> Inventory Registry</button>
+      <button data-view="air"><span class="ico">03</span> AIR</button>
 
-      <div class="nav-group" data-group="consumed">
-        <button class="nav-group-toggle" data-toggle="consumed" type="button">
-          <span class="ico">03</span> Consumed Inventory <span class="caret">&#9662;</span>
+      <div class="nav-group" data-group="issuance">
+        <button class="nav-group-toggle" data-toggle="issuance" type="button">
+          <span class="ico">04</span> Issuance <span class="caret">&#9662;</span>
         </button>
         <div class="nav-subitems">
           <button data-view="ris">RIS</button>
           <button data-view="rsmi">RSMI</button>
-        </div>
-      </div>
-
-      <div class="nav-group" data-group="distributed">
-        <button class="nav-group-toggle" data-toggle="distributed" type="button">
-          <span class="ico">04</span> Distributed Inventory <span class="caret">&#9662;</span>
-        </button>
-        <div class="nav-subitems">
-          <button data-view="ar">Acknowledgement Receipt</button>
-          <button data-view="distributed">Report</button>
+          <button data-view="issued">Issued Inventory</button>
         </div>
       </div>
 
@@ -90,10 +83,10 @@
     <div id="content">
       <div class="view" id="view-dashboard"></div>
       <div class="view" id="view-registry"></div>
+      <div class="view" id="view-air"></div>
       <div class="view" id="view-ris"></div>
       <div class="view" id="view-rsmi"></div>
-      <div class="view" id="view-ar"></div>
-      <div class="view" id="view-distributed"></div>
+      <div class="view" id="view-issued"></div>
       <div class="view" id="view-reconciliation"></div>
       <div class="view" id="view-users"></div>
     </div>
