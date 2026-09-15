@@ -168,6 +168,9 @@ textarea { resize: vertical; min-height: 60px; }
 }
 .btn {
   all: unset;
+  /* `all: unset` resets box-sizing to content-box, which made a width:100% button (.btn.block on
+     the sign-in screen) overflow its form by its own padding and border - put it back. */
+  box-sizing: border-box;
   display: inline-flex;
   align-items: center;
   justify-content: center;
