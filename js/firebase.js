@@ -2,6 +2,7 @@
 // Loaded as an ES module. Uses the Firebase v10 modular CDN build so nothing needs npm-installing
 // to run the app itself (only the seed scripts, which run under Node, need `npm install`).
 import { firebaseConfig, allowedEmailDomains } from "./firebase-config.js";
+import { emailAllowedBy } from "./allowlist.js";
 import {
   initializeApp,
 } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-app.js";
@@ -66,14 +67,11 @@ export function completeGoogleRedirect() {
   return getRedirectResult(auth);
 }
 
-// Optional guard. `allowedEmailDomains` is empty by default, which allows any account the Firebase
-// project itself accepts (the behaviour before Google sign-in existed). Fill it in to restrict
-// who can get in once Google sign-in is enabled - see README, "Google sign-in".
+// Optional guard. `allowedEmailDomains` is EMPTY by default, which allows any account the Firebase
+// project accepts - including any Google account. Fill it in only if you later want to narrow
+// that; see README, "Google sign-in".
 export function isAllowedAccount(user) {
-  const list = Array.isArray(allowedEmailDomains) ? allowedEmailDomains.filter(Boolean) : [];
-  if (!list.length) return true;
-  const email = ((user && user.email) || "").toLowerCase();
-  return list.some((d) => email.endsWith("@" + String(d).toLowerCase().replace(/^@/, "")));
+  return emailAllowedBy(user && user.email, allowedEmailDomains);
 }
 
 export function signOut() {
