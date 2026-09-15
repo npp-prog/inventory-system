@@ -71,13 +71,14 @@ export const RETIRE_REASONS = [
 ];
 
 const HARDCODED_ADMIN_EMAILS = ["npp@mgocandoniaccounting.org"];
-const EDITABLE_TABS = ["registry", "ris", "rsmi", "reconciliation"];
+const EDITABLE_TABS = ["registry", "ris", "rsmi", "ar", "reconciliation"];
 const VIEW_ONLY_TABS = ["dashboard", "consumed", "distributed"];
 const VIEW_TITLES = {
   dashboard: "Dashboard",
   registry: "Inventory Registry",
   ris: "Requisition and Issue Slip (RIS)",
   rsmi: "Report of Supplies and Materials Issued (RSMI)",
+  ar: "Acknowledgement Receipt",
   consumed: "Consumed Inventory",
   distributed: "Distributed Inventory",
   reconciliation: "Reconciliation",
@@ -95,10 +96,12 @@ const S = {
   items: new Map(),
   ris: new Map(),
   rsmi: new Map(),
+  ar: new Map(),
   tbSnapshots: new Map(),
   userRoles: new Map(),
   registryFilter: { q: "", account: "", disposition: "", status: "active" },
   risFilter: { q: "", status: "" },
+  arFilter: { q: "", status: "" },
   consumedFilter: { q: "", from: "", to: "" },
   distributedFilter: { q: "", from: "", to: "" },
   reconPeriod: null,
@@ -108,6 +111,7 @@ const S = {
 const colItems = fsCollection("items");
 const colRis = fsCollection("ris");
 const colRsmi = fsCollection("rsmi");
+const colAr = fsCollection("ar");
 const colTb = fsCollection("tb_snapshots");
 const colRoles = fsCollection("user_roles");
 
@@ -504,6 +508,54 @@ function rsmiHtml(r) {
     </table>`;
 }
 
+function arHtml(r) {
+  const lines = r.lines || [];
+  const rows = lines.map((l) => `
+    <tr>
+      <td>${esc(l.stock_no)}</td><td>${esc(l.description)}</td><td>${esc(l.unit)}</td>
+      <td class="right">${fmtNum(l.qty_issued != null ? l.qty_issued : l.qty_requested)}</td>
+      <td class="right">${fmtNum(l.unit_cost)}</td>
+      <td class="right">${fmtNum((l.qty_issued != null ? l.qty_issued : l.qty_requested) * (l.unit_cost || 0))}</td>
+    </tr>`).join("");
+  const pad = Math.max(0, 10 - lines.length);
+  const blanks = Array.from({ length: pad }).map(() => `<tr><td>&nbsp;</td><td></td><td></td><td></td><td></td><td></td></tr>`).join("");
+  const total = lines.reduce((s, l) => s + (l.qty_issued != null ? l.qty_issued : l.qty_requested || 0) * (l.unit_cost || 0), 0);
+  return `
+    ${printHeaderHtml("", "ACKNOWLEDGEMENT RECEIPT")}
+    <table class="noborder"><tr><td>Fund : <b>${esc(fundLabel(r.fund))}</b></td></tr></table>
+    <table class="noborder">
+      <tr><td>AR No. : <b>${esc(r.ar_no)}</b></td><td style="text-align:right;">Date : <b>${fmtDate(r.date)}</b></td></tr>
+      <tr><td>Recipient : <b>${esc(r.recipient_name || "")}</b></td><td style="text-align:right;">Barangay / Address : <b>${esc(r.recipient_barangay || "")}</b></td></tr>
+    </table>
+    <table>
+      <tr><th>Stock No.</th><th>Description</th><th>Unit</th><th>Quantity</th><th>Unit Cost</th><th>Amount</th></tr>
+      ${rows}${blanks}
+      <tr><td colspan="5" class="right"><b>Total</b></td><td class="right"><b>${fmtNum(total)}</b></td></tr>
+    </table>
+    <p style="margin-top:10px;">Purpose: ${esc(r.purpose || "")}</p>
+    <p style="margin-top:6px;">I acknowledge receipt of the above-listed item(s) in good order and condition.</p>
+    <table class="noborder" style="margin-top:20px;">
+      <tr>
+        <td class="center">Released by:</td><td class="center">Received by:</td><td class="center">Witnessed by:</td>
+      </tr>
+      <tr>
+        <td class="center" style="padding-top:30px;border-top:1px solid #000;">${esc(r.released_by_name || "")}</td>
+        <td class="center" style="padding-top:30px;border-top:1px solid #000;">${esc(r.received_by_name || "")}</td>
+        <td class="center" style="padding-top:30px;border-top:1px solid #000;">${esc(r.witnessed_by_name || "")}</td>
+      </tr>
+      <tr>
+        <td class="center poscap">Signature over Printed Name</td>
+        <td class="center poscap">Signature over Printed Name</td>
+        <td class="center poscap">Signature over Printed Name</td>
+      </tr>
+      <tr>
+        <td class="center poscap">${esc(r.released_by_position || "Property Custodian")}</td>
+        <td class="center poscap">${esc(r.received_by_position || "")}</td>
+        <td class="center poscap">${esc(r.witnessed_by_position || "")}</td>
+      </tr>
+    </table>`;
+}
+
 // ---------------------------------------------------------------------
 // Dashboard
 // ---------------------------------------------------------------------
@@ -549,8 +601,12 @@ function renderDashboard() {
       </tbody></table></div>` : `<div class="empty">Nothing is at or below its re-order point right now.</div>`}
     </div>
     <div class="panel">
-      <h3>Recent RIS</h3>
+      <h3>Recent RIS <span class="small" style="font-weight:normal;">(Consumed Inventory)</span></h3>
       ${renderRecentRisTable(fund)}
+    </div>
+    <div class="panel">
+      <h3>Recent Acknowledgement Receipts <span class="small" style="font-weight:normal;">(Distributed Inventory)</span></h3>
+      ${renderRecentArTable(fund)}
     </div>`;
   document.getElementById("view-dashboard").innerHTML = html;
 }
@@ -559,6 +615,13 @@ function renderRecentRisTable(fund) {
   if (!rows.length) return `<div class="empty">No RIS records yet.</div>`;
   return `<div class="table-wrap"><table><thead><tr><th>RIS No.</th><th>Date</th><th>Office</th><th>Status</th></tr></thead><tbody>
     ${rows.map((r) => `<tr class="clickable" onclick="openRisDetail('${r.id}')"><td>${esc(r.ris_no)}</td><td>${fmtDate(r.date)}</td><td>${esc(r.office || r.department || "")}</td><td><span class="pill ${r.status === "issued" ? "ok" : "muted"}">${r.status === "issued" ? "Issued" : "Draft"}</span></td></tr>`).join("")}
+  </tbody></table></div>`;
+}
+function renderRecentArTable(fund) {
+  const rows = [...S.ar.values()].filter((r) => r.fund === fund).sort((a, b) => (b.date || "").localeCompare(a.date || "")).slice(0, 8);
+  if (!rows.length) return `<div class="empty">No Acknowledgement Receipts yet.</div>`;
+  return `<div class="table-wrap"><table><thead><tr><th>AR No.</th><th>Date</th><th>Recipient</th><th>Status</th></tr></thead><tbody>
+    ${rows.map((r) => `<tr class="clickable" onclick="openArDetail('${r.id}')"><td>${esc(r.ar_no)}</td><td>${fmtDate(r.date)}</td><td>${esc(r.recipient_name || "")}${r.recipient_barangay ? " / " + esc(r.recipient_barangay) : ""}</td><td><span class="pill ${r.status === "issued" ? "ok" : "muted"}">${r.status === "issued" ? "Issued" : "Draft"}</span></td></tr>`).join("")}
   </tbody></table></div>`;
 }
 
@@ -988,14 +1051,10 @@ function openRisDetail(id) {
   if (!r) return;
   const canE = canEdit("ris");
   const rows = (r.lines || []).map((l) => {
-    const item = S.items.get(l.item_id);
-    const disp = l.disposition || (item && isDistributionAccount(item.account_code) ? "distributed" : "consumed");
     return `<tr>
       <td>${esc(l.stock_no)}</td><td>${esc(l.description)}</td>
       <td class="num">${fmtNum(l.qty_requested)}</td>
       <td class="num">${l.qty_issued != null ? fmtNum(l.qty_issued) : "—"}</td>
-      <td><span class="pill ${disp === "distributed" ? "distributed" : "consumed"}">${disp === "distributed" ? "Distributed" : "Consumed"}</span></td>
-      <td>${esc(l.recipient || "")}</td>
     </tr>`;
   }).join("");
   openModal(`
@@ -1007,8 +1066,9 @@ function openRisDetail(id) {
         <div><b>Status</b><br/><span class="pill ${r.status === "issued" ? "ok" : "muted"}">${r.status === "issued" ? "Issued" : "Draft"}</span></div>
       </div>
       <div class="hr"></div>
-      <div class="table-wrap"><table><thead><tr><th>Stock No.</th><th>Description</th><th class="num">Qty Req.</th><th class="num">Qty Issued</th><th>Type</th><th>Recipient</th></tr></thead><tbody>${rows}</tbody></table></div>
+      <div class="table-wrap"><table><thead><tr><th>Stock No.</th><th>Description</th><th class="num">Qty Req.</th><th class="num">Qty Issued</th></tr></thead><tbody>${rows}</tbody></table></div>
       <p class="small" style="margin-top:10px;"><b>Purpose:</b> ${esc(r.purpose || "")}</p>
+      <p class="small">RIS is used for <b>Consumed Inventory</b> only - issued stock is recorded as used internally by the requesting office. For issuances to a barangay, beneficiary, or the public, use an <b>Acknowledgement Receipt</b> instead.</p>
     </div>
     <div class="modal-foot">
       <button class="btn" onclick="printRis('${r.id}')">Print RIS</button>
@@ -1031,21 +1091,14 @@ function openIssueRisModal(id) {
   openModal(`
     <div class="modal-head"><h3>Issue RIS ${esc(r.ris_no)}</h3><button class="btn ghost" onclick="closeModal()">✕</button></div>
     <div class="modal-body">
-      <p class="small">Confirm the quantity actually issued for each line, and how each line should be classified. This deducts stock immediately and cannot be edited afterward (only reversed).</p>
-      <table class="line-table"><thead><tr><th>Item</th><th class="num">Qty Req.</th><th>Qty Issued</th><th>Type</th><th>Recipient / Barangay</th></tr></thead>
+      <p class="small">Confirm the quantity actually issued for each line. This deducts stock immediately and records it as <b>Consumed</b> by ${esc(r.office || r.department)} - it cannot be edited afterward (only reversed).</p>
+      <table class="line-table"><thead><tr><th>Item</th><th class="num">Qty Req.</th><th>Qty Issued</th></tr></thead>
       <tbody>
-        ${(r.lines || []).map((l, i) => {
-          const item = S.items.get(l.item_id);
-          const defaultDisp = item && isDistributionAccount(item.account_code) ? "distributed" : "consumed";
-          const disp = l.disposition || defaultDisp;
-          return `<tr>
+        ${(r.lines || []).map((l, i) => `<tr>
             <td>${esc(l.stock_no)} - ${esc(l.description)}</td>
             <td class="num">${fmtNum(l.qty_requested)}</td>
             <td><input class="iss_qty" data-idx="${i}" type="number" step="0.01" value="${l.qty_issued != null ? l.qty_issued : l.qty_requested}"/></td>
-            <td><select class="iss_disp" data-idx="${i}"><option value="consumed" ${disp === "consumed" ? "selected" : ""}>Consumed</option><option value="distributed" ${disp === "distributed" ? "selected" : ""}>Distributed</option></select></td>
-            <td><input class="iss_recipient" data-idx="${i}" value="${esc(l.recipient || (disp === "consumed" ? (r.office || r.department) : ""))}"/></td>
-          </tr>`;
-        }).join("")}
+          </tr>`).join("")}
       </tbody></table>
     </div>
     <div class="modal-foot">
@@ -1059,9 +1112,7 @@ function confirmIssueRis(id) {
   const r = S.ris.get(id);
   const lines = (r.lines || []).map((l, i) => {
     const qtyEl = document.querySelector(`.iss_qty[data-idx="${i}"]`);
-    const dispEl = document.querySelector(`.iss_disp[data-idx="${i}"]`);
-    const recEl = document.querySelector(`.iss_recipient[data-idx="${i}"]`);
-    return { ...l, qty_issued: Number(qtyEl.value) || 0, disposition: dispEl.value, recipient: recEl.value.trim() };
+    return { ...l, qty_issued: Number(qtyEl.value) || 0, disposition: "consumed", recipient: "" };
   });
   // Validate stock availability first.
   for (const l of lines) {
@@ -1079,7 +1130,7 @@ function confirmIssueRis(id) {
     const entry = {
       id: uid(), type: "issue", date: r.date, ref: r.ris_no,
       qty: l.qty_issued, unit_cost: uc, total_cost: round2(l.qty_issued * uc),
-      office, disposition: l.disposition, recipient: l.recipient, ris_id: r.id,
+      office, disposition: "consumed", ris_id: r.id,
       by: S.currentUser.email, at: Date.now(),
     };
     const ledger = (item.ledger || []).concat([entry]);
@@ -1087,7 +1138,7 @@ function confirmIssueRis(id) {
   }
   Promise.all(writes)
     .then(() => colRis.doc(id).update({ lines, status: "issued", issued_at: Date.now(), issued_by_email: S.currentUser.email }))
-    .then(() => { toast("RIS issued - stock updated."); closeModal(); })
+    .then(() => { toast("RIS issued - stock updated (Consumed Inventory)."); closeModal(); })
     .catch((e) => toast(e.message, true));
 }
 
@@ -1112,14 +1163,306 @@ function printRis(id) { openPrintWindow(risHtml(S.ris.get(id)), "portrait"); }
 
 function exportRisCsv() {
   const rows = filterRisRows(S.risFilter);
-  const header = ["RIS No.", "Date", "Department", "Office", "Purpose", "Status", "Stock No.", "Description", "Qty Requested", "Qty Issued", "Type", "Recipient"];
+  const header = ["RIS No.", "Date", "Department", "Office", "Purpose", "Status", "Stock No.", "Description", "Qty Requested", "Qty Issued"];
   const lines = [header.join(",")];
   for (const r of rows) {
     for (const l of r.lines || []) {
-      lines.push([r.ris_no, r.date, r.department, r.office, r.purpose, r.status, l.stock_no, l.description, l.qty_requested, l.qty_issued, l.disposition, l.recipient].map(csvField).join(","));
+      lines.push([r.ris_no, r.date, r.department, r.office, r.purpose, r.status, l.stock_no, l.description, l.qty_requested, l.qty_issued].map(csvField).join(","));
     }
   }
   browserDownload(`RIS_${S.currentFund}_${todayStr()}.csv`, lines.join("\n"), "text/csv");
+}
+
+// ---------------------------------------------------------------------
+// Acknowledgement Receipt (AR) - used whenever inventory is given out to a barangay, beneficiary,
+// or the public (Distributed Inventory). Mirrors the RIS draft -> issue -> reverse lifecycle, but
+// there is no official COA form for this - MGO Candoni had no reference to match, so this is a
+// reasonable design based on standard LGU distribution-record practice (recipient, items,
+// quantities, date, and three signature blocks).
+// ---------------------------------------------------------------------
+
+function filterArRows(f) {
+  const q = (f.q || "").toLowerCase();
+  let rows = [...S.ar.values()].filter((r) => r.fund === S.currentFund);
+  if (f.status) rows = rows.filter((r) => r.status === f.status);
+  if (q) rows = rows.filter((r) => [r.ar_no, r.recipient_name, r.recipient_barangay, r.purpose].some((v) => (v || "").toLowerCase().includes(q)));
+  rows.sort((a, b) => (b.ar_no || "").localeCompare(a.ar_no || ""));
+  return rows;
+}
+
+function renderAr() {
+  const saved = captureFocus("view-ar");
+  const f = S.arFilter;
+  const rows = filterArRows(f);
+  const canE = canEdit("ar");
+  document.getElementById("view-ar").innerHTML = `
+    <div class="panel small">Acknowledgement Receipt is used whenever inventory is given out to a barangay, beneficiary, or the public (Distributed Inventory). For inventory issued to an office for its own internal use, use RIS (Consumed Inventory) instead.</div>
+    <div class="toolbar">
+      <input class="grow" id="arSearch" placeholder="Search AR no., recipient, barangay, purpose..." value="${esc(f.q)}"/>
+      <select id="arStatusFilter">
+        <option value="" ${!f.status ? "selected" : ""}>All statuses</option>
+        <option value="draft" ${f.status === "draft" ? "selected" : ""}>Draft</option>
+        <option value="issued" ${f.status === "issued" ? "selected" : ""}>Issued</option>
+      </select>
+      <div class="toolbar-right">
+        <button class="btn" onclick="exportArCsv()">Download CSV</button>
+        ${canE ? `<button class="btn primary" onclick="openArModal()">+ New Acknowledgement Receipt</button>` : ""}
+      </div>
+    </div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>AR No.</th><th>Date</th><th>Recipient</th><th>Purpose</th><th>Status</th></tr></thead>
+      <tbody>${rows.length ? rows.map((r) => `
+        <tr class="clickable" onclick="openArDetail('${r.id}')">
+          <td>${esc(r.ar_no)}</td><td>${fmtDate(r.date)}</td><td>${esc(r.recipient_name || "")}${r.recipient_barangay ? " / " + esc(r.recipient_barangay) : ""}</td>
+          <td>${esc(r.purpose || "")}</td>
+          <td><span class="pill ${r.status === "issued" ? "ok" : "muted"}">${r.status === "issued" ? "Issued" : "Draft"}</span></td>
+        </tr>`).join("") : `<tr><td colspan="5"><div class="empty">No Acknowledgement Receipts match this filter.</div></td></tr>`}</tbody>
+    </table></div>`;
+  document.getElementById("arSearch").addEventListener("input", (e) => { S.arFilter.q = e.target.value; renderAr(); });
+  document.getElementById("arStatusFilter").addEventListener("change", (e) => { S.arFilter.status = e.target.value; renderAr(); });
+  restoreFocus(saved);
+}
+
+function arLineRowHtml(l, idx) {
+  const item = l.item_id ? S.items.get(l.item_id) : null;
+  return `<tr data-idx="${idx}">
+    <td><select class="ar_line_item" data-idx="${idx}">
+      <option value="">-- pick item --</option>
+      ${activeItems(S.currentFund).map((a) => `<option value="${a.id}" ${a.id === l.item_id ? "selected" : ""}>${esc(a.stock_no)} - ${esc(a.description)}</option>`).join("")}
+    </select></td>
+    <td>${esc(item ? item.unit : l.unit || "")}</td>
+    <td><input class="ar_line_qtyreq" data-idx="${idx}" type="number" step="0.01" value="${l.qty_requested || 0}"/></td>
+    <td><input class="ar_line_qtyiss" data-idx="${idx}" type="number" step="0.01" value="${l.qty_issued != null ? l.qty_issued : ""}"/></td>
+    <td><input class="ar_line_remarks" data-idx="${idx}" value="${esc(l.remarks || "")}"/></td>
+    <td><button class="btn ghost" onclick="removeArLine(${idx})">✕</button></td>
+  </tr>`;
+}
+
+let _arDraftLines = [];
+function addArLine() { _arDraftLines.push({}); renderArLinesTable(); }
+function removeArLine(idx) { _arDraftLines.splice(idx, 1); renderArLinesTable(); }
+function renderArLinesTable() {
+  const body = document.getElementById("arLinesBody");
+  if (!body) return;
+  body.innerHTML = _arDraftLines.map((l, i) => arLineRowHtml(l, i)).join("");
+}
+
+function openArModal(id) {
+  if (!canEdit("ar")) { toast("You have view-only access to Acknowledgement Receipt.", true); return; }
+  const r = id ? S.ar.get(id) : null;
+  _arDraftLines = r ? (r.lines || []).map((l) => ({ ...l })) : [{}];
+  const suggested = r ? r.ar_no : nextDocNumber(S.ar, S.currentFund, todayStr(), "ar_no");
+  openModal(`
+    <div class="modal-head"><h3>${r ? "Edit Acknowledgement Receipt" : "New Acknowledgement Receipt"}</h3><button class="btn ghost" onclick="closeModal()">✕</button></div>
+    <div class="modal-body">
+      <div class="grid2">
+        <div><label>AR No.</label><input id="ar_no" value="${esc(suggested)}"/></div>
+        <div><label>Date</label><input id="ar_date" type="date" value="${r ? r.date : todayStr()}"/></div>
+      </div>
+      <div class="grid2">
+        <div><label>Recipient (name / office)</label><input id="ar_recipient" value="${esc(r ? r.recipient_name : "")}"/></div>
+        <div><label>Barangay / Address</label><input id="ar_barangay" value="${esc(r ? r.recipient_barangay || "" : "")}"/></div>
+      </div>
+      <div class="hr"></div>
+      <table class="line-table"><thead><tr><th>Item</th><th>Unit</th><th>Qty Requested</th><th>Qty Issued</th><th>Remarks</th><th></th></tr></thead>
+        <tbody id="arLinesBody"></tbody>
+      </table>
+      <button class="btn" style="margin-top:8px;" onclick="addArLine()">+ Add line</button>
+      <div class="hr"></div>
+      <label>Purpose</label><textarea id="ar_purpose">${esc(r ? r.purpose || "" : "")}</textarea>
+      <div class="grid2">
+        <div><label>Released by (name)</label><input id="ar_rel_name" value="${esc(r ? r.released_by_name || "" : "")}"/></div>
+        <div><label>Released by (position)</label><input id="ar_rel_pos" value="${esc(r ? r.released_by_position || "PROPERTY CUSTODIAN" : "PROPERTY CUSTODIAN")}"/></div>
+      </div>
+      <div class="grid2">
+        <div><label>Received by (name)</label><input id="ar_rec_name" value="${esc(r ? r.received_by_name || "" : "")}"/></div>
+        <div><label>Received by (position)</label><input id="ar_rec_pos" value="${esc(r ? r.received_by_position || "" : "")}"/></div>
+      </div>
+      <div class="grid2">
+        <div><label>Witnessed by (name)</label><input id="ar_wit_name" value="${esc(r ? r.witnessed_by_name || "" : "")}"/></div>
+        <div><label>Witnessed by (position)</label><input id="ar_wit_pos" value="${esc(r ? r.witnessed_by_position || "" : "")}"/></div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn primary" onclick="saveAr('${r ? r.id : ""}')">Save as draft</button>
+    </div>`, "wide");
+  renderArLinesTable();
+  document.getElementById("arLinesBody").addEventListener("change", (e) => {
+    const idx = Number(e.target.dataset.idx);
+    if (idx == null || isNaN(idx)) return;
+    const l = _arDraftLines[idx] || (_arDraftLines[idx] = {});
+    if (e.target.classList.contains("ar_line_item")) {
+      l.item_id = e.target.value;
+      const item = S.items.get(l.item_id);
+      if (item) { l.stock_no = item.stock_no; l.description = item.description; l.unit = item.unit; }
+    } else if (e.target.classList.contains("ar_line_qtyreq")) l.qty_requested = Number(e.target.value) || 0;
+    else if (e.target.classList.contains("ar_line_qtyiss")) l.qty_issued = e.target.value === "" ? null : Number(e.target.value);
+    else if (e.target.classList.contains("ar_line_remarks")) l.remarks = e.target.value;
+  });
+}
+
+function collectArLines() {
+  return _arDraftLines.filter((l) => l.item_id).map((l) => ({
+    id: l.id || uid(), item_id: l.item_id, stock_no: l.stock_no, description: l.description, unit: l.unit,
+    qty_requested: Number(l.qty_requested) || 0,
+    qty_issued: l.qty_issued == null ? null : Number(l.qty_issued),
+    remarks: l.remarks || "",
+  }));
+}
+
+function saveAr(id) {
+  if (blockIfViewOnly("ar")) return;
+  const ar_no = document.getElementById("ar_no").value.trim();
+  const fund = S.currentFund;
+  if (numberTaken(S.ar, fund, "ar_no", ar_no, id)) { toast(`AR No. ${ar_no} is already used in this fund.`, true); return; }
+  const recipient_name = document.getElementById("ar_recipient").value.trim();
+  if (!recipient_name) { toast("Recipient is required.", true); return; }
+  const rec = {
+    fund, ar_no, date: document.getElementById("ar_date").value || todayStr(),
+    recipient_name, recipient_barangay: document.getElementById("ar_barangay").value.trim(),
+    lines: collectArLines(),
+    purpose: document.getElementById("ar_purpose").value.trim(),
+    released_by_name: document.getElementById("ar_rel_name").value.trim(),
+    released_by_position: document.getElementById("ar_rel_pos").value.trim(),
+    received_by_name: document.getElementById("ar_rec_name").value.trim(),
+    received_by_position: document.getElementById("ar_rec_pos").value.trim(),
+    witnessed_by_name: document.getElementById("ar_wit_name").value.trim(),
+    witnessed_by_position: document.getElementById("ar_wit_pos").value.trim(),
+    status: "draft",
+    updated_at: Date.now(),
+  };
+  if (!rec.lines.length) { toast("Add at least one item line.", true); return; }
+  if (id) {
+    colAr.doc(id).update(rec).then(() => { toast("Acknowledgement Receipt saved."); closeModal(); }).catch((e) => toast(e.message, true));
+  } else {
+    rec.created_at = Date.now();
+    colAr.doc().set(rec).then(() => { toast("Acknowledgement Receipt saved as draft."); closeModal(); }).catch((e) => toast(e.message, true));
+  }
+}
+
+function openArDetail(id) {
+  const r = S.ar.get(id);
+  if (!r) return;
+  const canE = canEdit("ar");
+  const rows = (r.lines || []).map((l) => `<tr>
+      <td>${esc(l.stock_no)}</td><td>${esc(l.description)}</td>
+      <td class="num">${fmtNum(l.qty_requested)}</td>
+      <td class="num">${l.qty_issued != null ? fmtNum(l.qty_issued) : "—"}</td>
+    </tr>`).join("");
+  openModal(`
+    <div class="modal-head"><h3>Acknowledgement Receipt ${esc(r.ar_no)}</h3><button class="btn ghost" onclick="closeModal()">✕</button></div>
+    <div class="modal-body">
+      <div class="grid3 small">
+        <div><b>Date</b><br/>${fmtDate(r.date)}</div>
+        <div><b>Recipient</b><br/>${esc(r.recipient_name)}${r.recipient_barangay ? " / " + esc(r.recipient_barangay) : ""}</div>
+        <div><b>Status</b><br/><span class="pill ${r.status === "issued" ? "ok" : "muted"}">${r.status === "issued" ? "Issued" : "Draft"}</span></div>
+      </div>
+      <div class="hr"></div>
+      <div class="table-wrap"><table><thead><tr><th>Stock No.</th><th>Description</th><th class="num">Qty Req.</th><th class="num">Qty Issued</th></tr></thead><tbody>${rows}</tbody></table></div>
+      <p class="small" style="margin-top:10px;"><b>Purpose:</b> ${esc(r.purpose || "")}</p>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" onclick="printAr('${r.id}')">Print AR</button>
+      ${canE && r.status !== "issued" ? `<button class="btn" onclick="closeModal();openArModal('${r.id}')">Edit</button><button class="btn primary" onclick="openIssueArModal('${r.id}')">Issue</button><button class="btn danger" onclick="deleteAr('${r.id}')">Delete</button>` : ""}
+      ${canE && r.status === "issued" ? `<button class="btn danger" onclick="reverseAr('${r.id}')">↩ Reverse issuance</button>` : ""}
+    </div>`, "wide");
+}
+
+function deleteAr(id) {
+  if (blockIfViewOnly("ar")) return;
+  const r = S.ar.get(id);
+  if (r && r.status === "issued") { toast("An issued Acknowledgement Receipt can only be undone via Reverse issuance.", true); return; }
+  if (!confirm("Delete this draft Acknowledgement Receipt?")) return;
+  colAr.doc(id).delete().then(() => { toast("Acknowledgement Receipt deleted."); closeModal(); }).catch((e) => toast(e.message, true));
+}
+
+function openIssueArModal(id) {
+  if (blockIfViewOnly("ar")) return;
+  const r = S.ar.get(id);
+  openModal(`
+    <div class="modal-head"><h3>Issue Acknowledgement Receipt ${esc(r.ar_no)}</h3><button class="btn ghost" onclick="closeModal()">✕</button></div>
+    <div class="modal-body">
+      <p class="small">Confirm the quantity actually released for each line. This deducts stock immediately and records it as <b>Distributed</b> to ${esc(r.recipient_name)}${r.recipient_barangay ? " (" + esc(r.recipient_barangay) + ")" : ""} - it cannot be edited afterward (only reversed).</p>
+      <table class="line-table"><thead><tr><th>Item</th><th class="num">Qty Req.</th><th>Qty Issued</th></tr></thead>
+      <tbody>
+        ${(r.lines || []).map((l, i) => `<tr>
+            <td>${esc(l.stock_no)} - ${esc(l.description)}</td>
+            <td class="num">${fmtNum(l.qty_requested)}</td>
+            <td><input class="ariss_qty" data-idx="${i}" type="number" step="0.01" value="${l.qty_issued != null ? l.qty_issued : l.qty_requested}"/></td>
+          </tr>`).join("")}
+      </tbody></table>
+    </div>
+    <div class="modal-foot">
+      <button class="btn ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn primary" onclick="confirmIssueAr('${r.id}')">Confirm issuance</button>
+    </div>`, "wide");
+}
+
+function confirmIssueAr(id) {
+  if (blockIfViewOnly("ar")) return;
+  const r = S.ar.get(id);
+  const lines = (r.lines || []).map((l, i) => {
+    const qtyEl = document.querySelector(`.ariss_qty[data-idx="${i}"]`);
+    return { ...l, qty_issued: Number(qtyEl.value) || 0 };
+  });
+  // Validate stock availability first.
+  for (const l of lines) {
+    const item = S.items.get(l.item_id);
+    if (!item) continue;
+    if (l.qty_issued > qtyBalance(item) + 1e-6) { toast(`Not enough stock for ${item.description} (balance ${fmtNum(qtyBalance(item))} ${item.unit}).`, true); return; }
+  }
+  const recipient = r.recipient_name + (r.recipient_barangay ? ` (${r.recipient_barangay})` : "");
+  const writes = [];
+  for (const l of lines) {
+    if (l.qty_issued <= 0) continue;
+    const item = S.items.get(l.item_id);
+    if (!item) continue;
+    const uc = unitCostBalance(item);
+    const entry = {
+      id: uid(), type: "issue", date: r.date, ref: r.ar_no,
+      qty: l.qty_issued, unit_cost: uc, total_cost: round2(l.qty_issued * uc),
+      disposition: "distributed", recipient, ar_id: r.id,
+      by: S.currentUser.email, at: Date.now(),
+    };
+    const ledger = (item.ledger || []).concat([entry]);
+    writes.push(colItems.doc(item.id).update({ ledger }));
+  }
+  Promise.all(writes)
+    .then(() => colAr.doc(id).update({ lines, status: "issued", issued_at: Date.now(), issued_by_email: S.currentUser.email }))
+    .then(() => { toast("Acknowledgement Receipt issued - stock updated (Distributed Inventory)."); closeModal(); })
+    .catch((e) => toast(e.message, true));
+}
+
+function reverseAr(id) {
+  if (blockIfViewOnly("ar")) return;
+  const r = S.ar.get(id);
+  if (!confirm(`Reverse issuance of Acknowledgement Receipt ${r.ar_no}? This restores the issued stock back onto each item and returns the AR to Draft.`)) return;
+  const writes = [];
+  for (const l of r.lines || []) {
+    const item = S.items.get(l.item_id);
+    if (!item || !l.qty_issued) continue;
+    const ledger = (item.ledger || []).filter((e) => !(e.ar_id === r.id));
+    writes.push(colItems.doc(item.id).update({ ledger }));
+  }
+  Promise.all(writes)
+    .then(() => colAr.doc(id).update({ status: "draft", issued_at: null, reversed_at: Date.now(), reversed_by: S.currentUser.email }))
+    .then(() => { toast("Issuance reversed."); closeModal(); })
+    .catch((e) => toast(e.message, true));
+}
+
+function printAr(id) { openPrintWindow(arHtml(S.ar.get(id)), "portrait"); }
+
+function exportArCsv() {
+  const rows = filterArRows(S.arFilter);
+  const header = ["AR No.", "Date", "Recipient", "Barangay/Address", "Purpose", "Status", "Stock No.", "Description", "Qty Requested", "Qty Issued"];
+  const lines = [header.join(",")];
+  for (const r of rows) {
+    for (const l of r.lines || []) {
+      lines.push([r.ar_no, r.date, r.recipient_name, r.recipient_barangay, r.purpose, r.status, l.stock_no, l.description, l.qty_requested, l.qty_issued].map(csvField).join(","));
+    }
+  }
+  browserDownload(`AR_${S.currentFund}_${todayStr()}.csv`, lines.join("\n"), "text/csv");
 }
 
 // ---------------------------------------------------------------------
@@ -1402,7 +1745,7 @@ function saveTbSnapshot() {
 // Users & Roles
 // ---------------------------------------------------------------------
 
-const TAB_KEYS = ["dashboard", "registry", "ris", "rsmi", "consumed", "distributed", "reconciliation"];
+const TAB_KEYS = ["dashboard", "registry", "ris", "rsmi", "ar", "consumed", "distributed", "reconciliation"];
 function summarizeRestrictions(role) {
   const t = role.tabs || {};
   const parts = [];
@@ -1506,7 +1849,7 @@ function submitChangePassword() {
 // ---------------------------------------------------------------------
 
 const RENDERERS = {
-  dashboard: renderDashboard, registry: renderRegistry, ris: renderRis, rsmi: renderRsmi,
+  dashboard: renderDashboard, registry: renderRegistry, ris: renderRis, rsmi: renderRsmi, ar: renderAr,
   consumed: renderConsumed, distributed: renderDistributed, reconciliation: renderReconciliation, users: renderUsers,
 };
 
@@ -1556,6 +1899,7 @@ export function initApp(user) {
   colItems.onSnapshot((rows) => { S.items = new Map(rows.map((r) => [r.id, r])); renderAll(); });
   colRis.onSnapshot((rows) => { S.ris = new Map(rows.map((r) => [r.id, r])); renderAll(); });
   colRsmi.onSnapshot((rows) => { S.rsmi = new Map(rows.map((r) => [r.id, r])); renderAll(); });
+  colAr.onSnapshot((rows) => { S.ar = new Map(rows.map((r) => [r.id, r])); renderAll(); });
   colTb.onSnapshot((rows) => { S.tbSnapshots = new Map(rows.map((r) => [r.id, r])); renderAll(); });
   colRoles.onSnapshot((rows) => { S.userRoles = new Map(rows.map((r) => [r.id, r])); renderAll(); });
 }
@@ -1577,6 +1921,8 @@ Object.assign(window, {
   openReceiptModal, saveReceipt, printSlc, printSc, exportRegistryCsv,
   openRisModal, saveRis, addRisLine, removeRisLine, openRisDetail, deleteRis,
   openIssueRisModal, confirmIssueRis, reverseRis, printRis, exportRisCsv,
+  openArModal, saveAr, addArLine, removeArLine, openArDetail, deleteAr,
+  openIssueArModal, confirmIssueAr, reverseAr, printAr, exportArCsv,
   openGenerateRsmiModal, generateRsmi, openRsmiDetail, deleteRsmi, printRsmi, exportRsmiCsv,
   exportIssuanceCsv, saveTbSnapshot,
   openUserRoleModal, saveUserRole, deleteUserRole,
