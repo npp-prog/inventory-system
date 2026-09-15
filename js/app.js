@@ -1589,7 +1589,7 @@ function renderAir() {
       </select>
       <div class="toolbar-right">
         <button class="btn" onclick="exportAirCsv()">Download CSV</button>
-        ${canE ? `<button class="btn primary" onclick="openAirModal()">+ New AIR</button>` : ""}
+        ${canE ? `<button class="btn" onclick="openBulkAirModal()">⇪ Bulk upload</button><button class="btn primary" onclick="openAirModal()">+ New AIR</button>` : ""}
       </div>
     </div>
     <div class="table-wrap"><table>
@@ -1999,6 +1999,172 @@ function exportAirCsv() {
   }
   browserDownload(`AIR_${S.currentFund}_${todayStr()}.csv`, lines.join("\n"), "text/csv");
 }
+
+// ---------------------------------------------------------------------
+// Bulk AIR upload - one spreadsheet, many Acceptance reports. Each row is one delivered item;
+// rows sharing an AIR No. are folded into a single AIR. Everything imports as "For Accounting",
+// so nothing becomes stock until each AIR is reviewed and received in Accounting as usual.
+// ---------------------------------------------------------------------
+
+const BULK_AIR_HEADERS = ["AIR No.", "Date", "Dept/Office", "Supplier", "PO No.", "PO Date",
+  "Requisitioning Office", "Invoice No.", "Invoice Date", "Date Received", "Acceptance", "Date Inspected",
+  "Custodian", "Inspector", "Stock/Property No.", "Description", "Unit", "Quantity", "Unit Cost",
+  "Account Code", "Batch No.", "Expiry"];
+let _bulkAirParsed = null;
+
+function downloadAirTemplate() {
+  const today = todayStr();
+  const sample = [
+    ["2026-09-9001", today, "General Services Office", "ABC Trading", "PO-2026-0142", today,
+      "Municipal Treasurer's Office", "SI-88213", today, today, "Complete", today,
+      "JUAN D. DELA CRUZ", "MARIA L. SANTOS", "OS-0001", "Bond Paper, A4", "REAM", "100", "250",
+      "10404010", "", ""],
+    ["2026-09-9002", today, "Rural Health Unit", "MedSupply Inc.", "PO-2026-0150", today,
+      "Rural Health Unit", "SI-90011", today, today, "Complete", today,
+      "JUAN D. DELA CRUZ", "MARIA L. SANTOS", "MED-0001", "Paracetamol 500mg", "TABLET", "5000", "2",
+      "10404060", "LOT-2026-A", "2027-06-30"],
+  ];
+  const lines = [BULK_AIR_HEADERS.join(",")].concat(sample.map((r) => r.map(csvField).join(",")));
+  browserDownload("AIR_bulk_upload_template.csv", lines.join("\n"), "text/csv");
+}
+
+function openBulkAirModal() {
+  if (!canEdit("air")) { toast("You have view-only access to Acceptance.", true); return; }
+  _bulkAirParsed = null;
+  openModal(`
+    <div class="modal-head"><h3>Bulk upload Acceptance reports</h3><button class="btn ghost" onclick="closeModal()">✕</button></div>
+    <div class="modal-body">
+      <p class="small">One row per delivered item. Rows sharing the same <b>AIR No.</b> become a single Acceptance report, taking their header details (supplier, dates, signatories) from the first of those rows. A <b>Stock/Property No.</b> already in the ${esc(fundLabel(S.currentFund))} registry files itself inside that item on posting; anything else becomes a new item. Everything imports as <b>For Accounting</b> - nothing becomes stock until you receive each one in Accounting.</p>
+      <p class="small"><b>Columns:</b> ${BULK_AIR_HEADERS.join(" &middot; ")}</p>
+      <p class="small"><b>Acceptance</b> is "Complete" or "Partial". <b>Account Code</b> is the inventory account (e.g. 10404010); leave it blank to inherit it from an existing item or fall back to Other Supplies. <b>Batch No.</b> and <b>Expiry</b> apply to medicines (10404060) and are ignored elsewhere.</p>
+      <button class="btn" onclick="downloadAirTemplate()">⇩ Download blank template (CSV)</button>
+      <div class="hr"></div>
+      <label>Upload a file (.xlsx / .xls / .csv)</label><input id="bulkAirFile" type="file" accept=".xlsx,.xls,.csv"/>
+      <label>...or paste rows (tab- or comma-delimited, header row optional)</label>
+      <textarea id="bulkAirPaste" rows="7" placeholder="AIR No.&#9;Date&#9;Dept/Office&#9;Supplier&#9;..."></textarea>
+      <div id="bulkAirPreview"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn" onclick="previewBulkAir()">Check rows</button>
+      <button class="btn primary" onclick="importBulkAir()">Import for Accounting</button>
+    </div>`, "wide");
+  const fileEl = document.getElementById("bulkAirFile");
+  fileEl.addEventListener("change", () => {
+    const file = fileEl.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const wb = window.XLSX.read(ev.target.result, { type: "array" });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        const rowsArr = window.XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: "" });
+        document.getElementById("bulkAirPaste").value = rowsArr.map((r) => (r || []).slice(0, BULK_AIR_HEADERS.length).join("\t")).join("\n");
+        previewBulkAir();
+      } catch (e) { toast("Could not read that file.", true); }
+    };
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+// Excel hands dates back in a few shapes depending on how the sheet was formatted; normalise the
+// common ones to the YYYY-MM-DD the date inputs and the ledger use.
+function normalizeDate(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return "";
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  const mdy = s.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/);
+  if (mdy) return `${mdy[3]}-${String(mdy[1]).padStart(2, "0")}-${String(mdy[2]).padStart(2, "0")}`;
+  const d = new Date(s);
+  if (!isNaN(d)) return d.toISOString().slice(0, 10);
+  return "";
+}
+
+function parseBulkAirText(text) {
+  const fund = S.currentFund;
+  const errors = [];
+  const byNo = new Map();
+  const rawLines = text.split("\n").map((l) => l.replace(/\r$/, "")).filter((l) => l.trim());
+  rawLines.forEach((line, i) => {
+    const cells = (line.includes("\t") ? line.split("\t") : splitCsvLine(line)).map((c) => c.trim());
+    if (!cells[0]) return;
+    if (i === 0 && cells[0].toLowerCase().replace(/[^a-z]/g, "") === "airno") return; // header row
+    const [air_no, date, dept_office, supplier, po_no, po_date, requisitioning_office, inv_no, inv_date,
+      date_received, acceptanceRaw, date_inspected, custodian_name, inspector_name,
+      stock_no, description, unit, qtyRaw, unitCostRaw, accountRaw, batch_no, expiryRaw] = cells;
+    const rowNo = i + 1;
+    if (!stock_no) { errors.push(`Row ${rowNo}: no Stock/Property No.`); return; }
+    const qty = Number(qtyRaw) || 0;
+    if (qty <= 0) { errors.push(`Row ${rowNo}: quantity must be greater than zero.`); return; }
+    if (numberTaken(S.air, fund, "air_no", air_no, null)) { errors.push(`Row ${rowNo}: AIR No. ${air_no} already exists in this fund.`); return; }
+    const known = itemByStockNo(fund, stock_no);
+    let account_code = String(accountRaw || "").trim();
+    if (account_code && !accountInfo(account_code)) {
+      errors.push(`Row ${rowNo}: account code "${account_code}" isn't in the chart of accounts.`);
+      return;
+    }
+    if (!account_code) account_code = (known && known.account_code) || "10404990";
+    const rec = byNo.get(air_no) || {
+      fund, air_no, date: normalizeDate(date) || todayStr(),
+      dept_office: dept_office || "", supplier: supplier || "",
+      po_no: po_no || "", po_date: normalizeDate(po_date),
+      requisitioning_office: requisitioning_office || "",
+      inv_no: inv_no || "", inv_date: normalizeDate(inv_date),
+      date_received: normalizeDate(date_received) || normalizeDate(date) || todayStr(),
+      acceptance: String(acceptanceRaw || "").toLowerCase().startsWith("p") ? "partial" : "complete",
+      partial_note: "",
+      date_inspected: normalizeDate(date_inspected) || normalizeDate(date) || todayStr(),
+      inspected_ok: true,
+      custodian_name: custodian_name || "", inspector_name: inspector_name || "",
+      lines: [], status: "for_accounting",
+      _new_items: 0, _existing_items: 0,
+    };
+    const med = isMedicineAccount(account_code);
+    rec.lines.push({
+      id: uid(),
+      stock_no, description: description || (known ? known.description : ""),
+      unit: unit || (known ? known.unit : ""),
+      qty, unit_cost: Number(unitCostRaw) || 0, account_code,
+      batch_no: med ? (batch_no || "") : "",
+      expiry_date: med ? normalizeDate(expiryRaw) : "",
+    });
+    if (known) rec._existing_items++; else rec._new_items++;
+    byNo.set(air_no, rec);
+  });
+  return { records: [...byNo.values()], errors };
+}
+
+function previewBulkAir() {
+  const text = document.getElementById("bulkAirPaste").value;
+  if (!text.trim()) { toast("Paste some rows or pick a file first.", true); return null; }
+  const { records, errors } = parseBulkAirText(text);
+  _bulkAirParsed = records;
+  const wrap = document.getElementById("bulkAirPreview");
+  wrap.innerHTML = `
+    <div class="hr"></div>
+    <h3 style="font-size:13px;">${records.length} Acceptance report(s) ready &middot; ${records.reduce((s, r) => s + r.lines.length, 0)} line(s)${errors.length ? ` &middot; ${errors.length} row(s) skipped` : ""}</h3>
+    ${records.length ? `<div class="table-wrap"><table><thead><tr><th>AIR No.</th><th>Date</th><th>Supplier</th><th>Dept/Office</th><th class="num">Lines</th><th class="num">Value</th><th>Items</th></tr></thead><tbody>
+      ${records.map((r) => `<tr><td>${esc(r.air_no)}</td><td>${fmtDate(r.date)}</td><td>${esc(r.supplier)}</td><td>${esc(r.dept_office)}</td>
+        <td class="num">${r.lines.length}</td><td class="num">${fmtMoney(airTotal(r))}</td>
+        <td class="small">${r._existing_items ? `${r._existing_items} existing` : ""}${r._existing_items && r._new_items ? " &middot; " : ""}${r._new_items ? `<span class="pill check">${r._new_items} new</span>` : ""}</td></tr>`).join("")}
+    </tbody></table></div>` : ""}
+    ${errors.length ? `<div class="panel small" style="margin-top:10px;"><b>Skipped rows</b><br/>${errors.map(esc).join("<br/>")}</div>` : ""}`;
+  return records;
+}
+
+function importBulkAir() {
+  if (blockIfViewOnly("air")) return;
+  const records = _bulkAirParsed || previewBulkAir();
+  if (!records || !records.length) { toast("Nothing to import - check the rows first.", true); return; }
+  const writes = records.map((rec) => {
+    const { _new_items, _existing_items, ...doc } = rec;
+    return colAir.doc().set({ ...doc, created_at: Date.now(), updated_at: Date.now(), created_by: S.currentUser.email });
+  });
+  Promise.all(writes)
+    .then(() => { toast(`${records.length} Acceptance report(s) imported - waiting for Accounting.`); closeModal(); })
+    .catch((e) => toast(e.message, true));
+}
+
 
 // ---------------------------------------------------------------------
 // RSMI - Report of Supplies and Materials Issued (generated recap of issued RIS)
@@ -2497,6 +2663,7 @@ Object.assign(window, {
   exportMedicinesCsv,
   openAirModal, saveAir, addAirLine, removeAirLine, openAirDetail, deleteAir,
   openPostAirModal, confirmPostAir, unpostAir, printAir, exportAirCsv,
+  openBulkAirModal, downloadAirTemplate, previewBulkAir, importBulkAir,
   openRisModal, saveRis, addRisLine, removeRisLine, openRisDetail, deleteRis,
   toggleRisRecipientFields, openIssueRisModal, confirmIssueRis, reverseRis, printRis, exportRisCsv,
   openBulkRisModal, downloadRisTemplate, previewBulkRis, importBulkRis,
