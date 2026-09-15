@@ -71,18 +71,28 @@ export const RETIRE_REASONS = [
 ];
 
 const HARDCODED_ADMIN_EMAILS = ["npp@mgocandoniaccounting.org"];
-const EDITABLE_TABS = ["registry", "ris", "rsmi", "ar", "reconciliation"];
-const VIEW_ONLY_TABS = ["dashboard", "distributed"];
+const EDITABLE_TABS = ["registry", "air", "ris", "rsmi", "reconciliation"];
+const VIEW_ONLY_TABS = ["dashboard", "issued"];
 const VIEW_TITLES = {
   dashboard: "Dashboard",
   registry: "Inventory Registry",
+  air: "Acceptance and Inspection Report (AIR)",
   ris: "Requisition and Issue Slip (RIS)",
   rsmi: "Report of Supplies and Materials Issued (RSMI)",
-  ar: "Acknowledgement Receipt",
-  distributed: "Distributed Inventory",
+  issued: "Issued Inventory",
   reconciliation: "Reconciliation",
   users: "Users & Roles",
 };
+
+// A RIS is the single issuance document for both kinds of release - Consumption (used up
+// internally by an office) and Distribution (given out to a barangay, beneficiary, or the
+// public). The type is set per RIS; a Distribution RIS also carries a Recipient/Barangay.
+const ISSUE_TYPES = [
+  { code: "consumption", label: "Consumption", disposition: "consumed" },
+  { code: "distribution", label: "Distribution", disposition: "distributed" },
+];
+function issueTypeInfo(code) { return ISSUE_TYPES.find((t) => t.code === code) || ISSUE_TYPES[0]; }
+function issueTypeLabel(code) { return issueTypeInfo(code).label; }
 
 // ---------------------------------------------------------------------
 // State
@@ -93,23 +103,23 @@ const S = {
   currentFund: localStorage.getItem("imsFund") || "GF",
   view: "dashboard",
   items: new Map(),
+  air: new Map(),
   ris: new Map(),
   rsmi: new Map(),
-  ar: new Map(),
   tbSnapshots: new Map(),
   userRoles: new Map(),
-  registryFilter: { q: "", account: "", disposition: "", status: "active" },
-  risFilter: { q: "", status: "" },
-  arFilter: { q: "", status: "" },
-  distributedFilter: { q: "", from: "", to: "" },
+  registryFilter: { q: "", account: "", disposition: "", status: "with_balance" },
+  airFilter: { q: "", status: "" },
+  risFilter: { q: "", status: "", type: "" },
+  issuedFilter: { q: "", from: "", to: "", type: "" },
   reconPeriod: null,
   _billingDraftUnused: null,
 };
 
 const colItems = fsCollection("items");
+const colAir = fsCollection("air");
 const colRis = fsCollection("ris");
 const colRsmi = fsCollection("rsmi");
-const colAr = fsCollection("ar");
 const colTb = fsCollection("tb_snapshots");
 const colRoles = fsCollection("user_roles");
 
@@ -244,6 +254,17 @@ function applyAccessControlToNav() {
 // ---------------------------------------------------------------------
 
 function activeItems(fund) { return [...S.items.values()].filter((a) => a.fund === fund && a.status !== "discontinued"); }
+// The registry holds ONE doc per Stock/Property No. per fund. Every later receipt of the same
+// stock number (from a posted AIR) is appended inside that same item's ledger rather than
+// creating a second row - the same way issuances are.
+function itemByStockNo(fund, stockNo) {
+  const key = String(stockNo || "").trim().toLowerCase();
+  if (!key) return null;
+  for (const a of S.items.values()) {
+    if (a.fund === fund && String(a.stock_no || "").trim().toLowerCase() === key) return a;
+  }
+  return null;
+}
 function itemLedgerSorted(item) {
   return (item.ledger || []).slice().sort((a, b) => (a.date || "").localeCompare(b.date || "") || (a.at || 0) - (b.at || 0));
 }
@@ -319,7 +340,12 @@ function accountOptionsHtml(selected) {
 // Printable forms (SLC / SC / RIS / RSMI) - matching the official Appendix layouts
 // ---------------------------------------------------------------------
 
-const SEAL_HTML = `<div style="width:60px;height:60px;border-radius:50%;background:#eee;display:inline-flex;align-items:center;justify-content:center;font-weight:bold;font-size:20px;">M</div>`;
+// The municipal seal, served from this repo's own assets/ folder. Print windows are opened with
+// document.write() on the same origin, so an absolute URL built from the app's own path is what
+// makes the logo show up there as well as in the app shell.
+const APP_BASE_URL = location.origin + location.pathname.replace(/[^/]*$/, "");
+const LOGO_URL = APP_BASE_URL + "assets/logo.png";
+const SEAL_HTML = `<img src="${LOGO_URL}" alt="Municipality of Candoni" style="width:62px;height:62px;object-fit:contain;"/>`;
 
 function printHeaderHtml(appendixNo, title) {
   return `
@@ -439,7 +465,8 @@ function risHtml(r) {
     <table class="noborder"><tr><td>Fund : <b>${esc(fundLabel(r.fund))}</b></td></tr></table>
     <table class="noborder">
       <tr><td>Department : <b>${esc(r.department)}</b></td><td>FPP Code: <b>${esc(r.fpp_code || "")}</b></td><td style="text-align:right;">Date: <b>${fmtDate(r.date)}</b></td></tr>
-      <tr><td>Office : <b>${esc(r.office || "")}</b></td><td>RIS No. : <b>${esc(r.ris_no)}</b></td><td></td></tr>
+      <tr><td>Office : <b>${esc(r.office || "")}</b></td><td>RIS No. : <b>${esc(r.ris_no)}</b></td><td style="text-align:right;">Type: <b>${esc(issueTypeLabel(r.issue_type))}</b></td></tr>
+      ${r.issue_type === "distribution" ? `<tr><td colspan="2">Recipient : <b>${esc(r.recipient_name || "")}</b></td><td style="text-align:right;">Barangay/Address : <b>${esc(r.recipient_barangay || "")}</b></td></tr>` : ""}
     </table>
     <table>
       <tr><th colspan="4">Requisition</th><th colspan="2">Issuance</th></tr>
@@ -514,50 +541,47 @@ function rsmiHtml(r) {
     </table>`;
 }
 
-function arHtml(r) {
+function airHtml(r) {
   const lines = r.lines || [];
   const rows = lines.map((l) => `
     <tr>
-      <td>${esc(l.stock_no)}</td><td>${esc(l.description)}</td><td>${esc(l.unit)}</td>
-      <td class="right">${fmtNum(l.qty_issued != null ? l.qty_issued : l.qty_requested)}</td>
-      <td class="right">${fmtNum(l.unit_cost)}</td>
-      <td class="right">${fmtNum((l.qty_issued != null ? l.qty_issued : l.qty_requested) * (l.unit_cost || 0))}</td>
+      <td>${esc(l.stock_no)}</td><td>${esc(l.description)}</td><td class="center">${esc(l.unit)}</td>
+      <td class="right">${fmtNum(l.qty)}</td>
     </tr>`).join("");
-  const pad = Math.max(0, 10 - lines.length);
-  const blanks = Array.from({ length: pad }).map(() => `<tr><td>&nbsp;</td><td></td><td></td><td></td><td></td><td></td></tr>`).join("");
-  const total = lines.reduce((s, l) => s + (l.qty_issued != null ? l.qty_issued : l.qty_requested || 0) * (l.unit_cost || 0), 0);
+  const pad = Math.max(0, 16 - lines.length);
+  const blanks = Array.from({ length: pad }).map(() => `<tr><td>&nbsp;</td><td></td><td></td><td></td></tr>`).join("");
+  const box = (on) => `<span style="display:inline-block;width:13px;height:13px;border:1px solid #000;text-align:center;line-height:13px;font-size:11px;">${on ? "&#10003;" : "&nbsp;"}</span>`;
   return `
-    ${printHeaderHtml("", "ACKNOWLEDGEMENT RECEIPT")}
-    <table class="noborder"><tr><td>Fund : <b>${esc(fundLabel(r.fund))}</b></td></tr></table>
+    ${printHeaderHtml("", "ACCEPTANCE AND INSPECTION REPORT")}
     <table class="noborder">
-      <tr><td>AR No. : <b>${esc(r.ar_no)}</b></td><td style="text-align:right;">Date : <b>${fmtDate(r.date)}</b></td></tr>
-      <tr><td>Recipient : <b>${esc(r.recipient_name || "")}</b></td><td style="text-align:right;">Barangay / Address : <b>${esc(r.recipient_barangay || "")}</b></td></tr>
+      <tr><td style="width:60%;">Dept/Office : <b>${esc(r.dept_office || "")}</b></td><td>Fund : <b>${esc(fundLabel(r.fund))}</b></td></tr>
+    </table>
+    <table class="noborder">
+      <tr><td style="width:60%;">Supplier : <b>${esc(r.supplier || "")}</b></td><td>AIR No. : <b>${esc(r.air_no)}</b></td></tr>
+      <tr><td>PO No./Date : <b>${esc(r.po_no || "")}</b>${r.po_date ? " / " + fmtDate(r.po_date) : ""}</td><td>Date : <b>${fmtDate(r.date)}</b></td></tr>
+      <tr><td>Requisitioning Office/Dept. : <b>${esc(r.requisitioning_office || "")}</b></td><td>Inv No. : <b>${esc(r.inv_no || "")}</b></td></tr>
+      <tr><td></td><td>Date : <b>${r.inv_date ? fmtDate(r.inv_date) : ""}</b></td></tr>
     </table>
     <table>
-      <tr><th>Stock No.</th><th>Description</th><th>Unit</th><th>Quantity</th><th>Unit Cost</th><th>Amount</th></tr>
+      <tr><th style="width:16%;">Stock/ Property<br/>No.</th><th>Description</th><th style="width:11%;">Unit</th><th style="width:15%;">Quantity</th></tr>
       ${rows}${blanks}
-      <tr><td colspan="5" class="right"><b>Total</b></td><td class="right"><b>${fmtNum(total)}</b></td></tr>
     </table>
-    <p style="margin-top:10px;">Purpose: ${esc(r.purpose || "")}</p>
-    <p style="margin-top:6px;">I acknowledge receipt of the above-listed item(s) in good order and condition.</p>
-    <table class="noborder" style="margin-top:20px;">
+    <table style="margin-top:0;">
+      <tr><th style="width:50%;"><i>ACCEPTANCE</i></th><th><i>INSPECTION</i></th></tr>
       <tr>
-        <td class="center">Released by:</td><td class="center">Received by:</td><td class="center">Witnessed by:</td>
-      </tr>
-      <tr>
-        <td class="center" style="padding-top:30px;border-top:1px solid #000;">${esc(r.released_by_name || "")}</td>
-        <td class="center" style="padding-top:30px;border-top:1px solid #000;">${esc(r.received_by_name || "")}</td>
-        <td class="center" style="padding-top:30px;border-top:1px solid #000;">${esc(r.witnessed_by_name || "")}</td>
-      </tr>
-      <tr>
-        <td class="center poscap">Signature over Printed Name</td>
-        <td class="center poscap">Signature over Printed Name</td>
-        <td class="center poscap">Signature over Printed Name</td>
-      </tr>
-      <tr>
-        <td class="center poscap">${esc(r.released_by_position || "Property Custodian")}</td>
-        <td class="center poscap">${esc(r.received_by_position || "")}</td>
-        <td class="center poscap">${esc(r.witnessed_by_position || "")}</td>
+        <td style="vertical-align:top;padding:8px;">
+          <div>Date Received : <b>${r.date_received ? fmtDate(r.date_received) : ""}</b></div>
+          <div style="margin-top:10px;">${box(r.acceptance === "complete")} &nbsp;Complete</div>
+          <div style="margin-top:6px;">${box(r.acceptance === "partial")} &nbsp;Partial (pls. specify) <i>${esc(r.partial_note || "")}</i></div>
+          <div style="margin-top:34px;" class="center"><b>${esc(r.custodian_name || "")}</b></div>
+          <div class="center poscap" style="border-top:1px solid #000;">Supply and/or Property Custodian</div>
+        </td>
+        <td style="vertical-align:top;padding:8px;">
+          <div>Date Inspected : <b>${r.date_inspected ? fmtDate(r.date_inspected) : ""}</b></div>
+          <div style="margin-top:10px;">${box(!!r.inspected_ok)} &nbsp;Inspected, verified and found in order as to quantity and specifications</div>
+          <div style="margin-top:34px;" class="center"><b>${esc(r.inspector_name || "")}</b></div>
+          <div class="center poscap" style="border-top:1px solid #000;">Inspection Officer/Inspection Committee</div>
+        </td>
       </tr>
     </table>`;
 }
@@ -569,6 +593,7 @@ function arHtml(r) {
 function renderDashboard() {
   const fund = S.currentFund;
   const items = activeItems(fund);
+  const onHand = items.filter((a) => Math.abs(qtyBalance(a)) > 1e-9);
   const totalValue = items.reduce((s, a) => s + costBalance(a), 0);
   const ytdFrom = new Date().getFullYear() + "-01-01";
   let consumedYtd = 0, distributedYtd = 0;
@@ -579,7 +604,8 @@ function renderDashboard() {
       else consumedYtd += Number(e.total_cost) || 0;
     }
   }
-  const lowStock = items.filter(isLowStock);
+  const lowStock = onHand.filter(isLowStock);
+  const pendingAir = [...S.air.values()].filter((r) => r.fund === fund && r.status !== "posted");
   const tbForFund = [...S.tbSnapshots.values()].filter((t) => t.fund === fund).sort((a, b) => (a.period || "").localeCompare(b.period || ""));
   const latestTb = tbForFund[tbForFund.length - 1];
   let reconOk = 0, reconCheck = 0;
@@ -594,9 +620,10 @@ function renderDashboard() {
 
   const html = `
     <div class="cardrow">
-      <div class="card"><div class="label">Total Inventory Value</div><div class="value">${fmtMoney(totalValue)}</div><div class="foot">${items.length} active item(s) &middot; ${fundLabel(fund)}</div></div>
-      <div class="card"><div class="label">Consumed (YTD)</div><div class="value">${fmtMoney(consumedYtd)}</div><div class="foot">Issued to offices, used internally</div></div>
-      <div class="card"><div class="label">Distributed (YTD)</div><div class="value">${fmtMoney(distributedYtd)}</div><div class="foot">Issued to barangays / beneficiaries / the public</div></div>
+      <div class="card"><div class="label">Total Inventory Value</div><div class="value">${fmtMoney(totalValue)}</div><div class="foot">${onHand.length} item(s) on hand &middot; ${fundLabel(fund)}</div></div>
+      <div class="card ${pendingAir.length ? "warn" : ""}"><div class="label">AIR Awaiting Accounting</div><div class="value">${pendingAir.length}</div><div class="foot">received, not yet in the registry</div></div>
+      <div class="card"><div class="label">Issued - Consumption (YTD)</div><div class="value">${fmtMoney(consumedYtd)}</div><div class="foot">used internally by offices</div></div>
+      <div class="card"><div class="label">Issued - Distribution (YTD)</div><div class="value">${fmtMoney(distributedYtd)}</div><div class="foot">to barangays / beneficiaries / the public</div></div>
       <div class="card ${lowStock.length ? "warn" : ""}"><div class="label">Low Stock</div><div class="value">${lowStock.length}</div><div class="foot">at or below re-order point</div></div>
       <div class="card ${reconCheck ? "warn" : ""}"><div class="label">Reconciliation</div><div class="value">${latestTb ? `${reconOk} OK / ${reconCheck} check` : "No TB yet"}</div><div class="foot">${latestTb ? fmtDate(latestTb.period + "-01") : "Paste a Trial Balance to begin"}</div></div>
     </div>
@@ -607,27 +634,31 @@ function renderDashboard() {
       </tbody></table></div>` : `<div class="empty">Nothing is at or below its re-order point right now.</div>`}
     </div>
     <div class="panel">
-      <h3>Recent RIS <span class="small" style="font-weight:normal;">(Consumed Inventory)</span></h3>
-      ${renderRecentRisTable(fund)}
+      <h3>Recent Acceptance and Inspection Reports <span class="small" style="font-weight:normal;">(incoming deliveries)</span></h3>
+      ${renderRecentAirTable(fund)}
     </div>
     <div class="panel">
-      <h3>Recent Acknowledgement Receipts <span class="small" style="font-weight:normal;">(Distributed Inventory)</span></h3>
-      ${renderRecentArTable(fund)}
+      <h3>Recent RIS <span class="small" style="font-weight:normal;">(issuances - consumption and distribution)</span></h3>
+      ${renderRecentRisTable(fund)}
     </div>`;
   document.getElementById("view-dashboard").innerHTML = html;
 }
 function renderRecentRisTable(fund) {
   const rows = [...S.ris.values()].filter((r) => r.fund === fund).sort((a, b) => (b.date || "").localeCompare(a.date || "")).slice(0, 8);
   if (!rows.length) return `<div class="empty">No RIS records yet.</div>`;
-  return `<div class="table-wrap"><table><thead><tr><th>RIS No.</th><th>Date</th><th>Office</th><th>Status</th></tr></thead><tbody>
-    ${rows.map((r) => `<tr class="clickable" onclick="openRisDetail('${r.id}')"><td>${esc(r.ris_no)}</td><td>${fmtDate(r.date)}</td><td>${esc(r.office || r.department || "")}</td><td><span class="pill ${r.status === "issued" ? "ok" : "muted"}">${r.status === "issued" ? "Issued" : "Draft"}</span></td></tr>`).join("")}
+  return `<div class="table-wrap"><table><thead><tr><th>RIS No.</th><th>Date</th><th>Type</th><th>Issued to</th><th>Status</th></tr></thead><tbody>
+    ${rows.map((r) => `<tr class="clickable" onclick="openRisDetail('${r.id}')"><td>${esc(r.ris_no)}</td><td>${fmtDate(r.date)}</td>
+      <td><span class="pill ${r.issue_type === "distribution" ? "distributed" : "consumed"}">${esc(issueTypeLabel(r.issue_type))}</span></td>
+      <td>${esc(risIssuedTo(r))}</td>
+      <td><span class="pill ${r.status === "issued" ? "ok" : "muted"}">${r.status === "issued" ? "Issued" : "Draft"}</span></td></tr>`).join("")}
   </tbody></table></div>`;
 }
-function renderRecentArTable(fund) {
-  const rows = [...S.ar.values()].filter((r) => r.fund === fund).sort((a, b) => (b.date || "").localeCompare(a.date || "")).slice(0, 8);
-  if (!rows.length) return `<div class="empty">No Acknowledgement Receipts yet.</div>`;
-  return `<div class="table-wrap"><table><thead><tr><th>AR No.</th><th>Date</th><th>Recipient</th><th>Status</th></tr></thead><tbody>
-    ${rows.map((r) => `<tr class="clickable" onclick="openArDetail('${r.id}')"><td>${esc(r.ar_no)}</td><td>${fmtDate(r.date)}</td><td>${esc(r.recipient_name || "")}${r.recipient_barangay ? " / " + esc(r.recipient_barangay) : ""}</td><td><span class="pill ${r.status === "issued" ? "ok" : "muted"}">${r.status === "issued" ? "Issued" : "Draft"}</span></td></tr>`).join("")}
+function renderRecentAirTable(fund) {
+  const rows = [...S.air.values()].filter((r) => r.fund === fund).sort((a, b) => (b.date || "").localeCompare(a.date || "")).slice(0, 8);
+  if (!rows.length) return `<div class="empty">No Acceptance and Inspection Reports yet.</div>`;
+  return `<div class="table-wrap"><table><thead><tr><th>AIR No.</th><th>Date</th><th>Supplier</th><th>Status</th></tr></thead><tbody>
+    ${rows.map((r) => `<tr class="clickable" onclick="openAirDetail('${r.id}')"><td>${esc(r.air_no)}</td><td>${fmtDate(r.date)}</td><td>${esc(r.supplier || "")}</td>
+      <td><span class="pill ${r.status === "posted" ? "ok" : "muted"}">${r.status === "posted" ? "In Registry" : "For Accounting"}</span></td></tr>`).join("")}
   </tbody></table></div>`;
 }
 
@@ -637,8 +668,19 @@ function renderRecentArTable(fund) {
 
 function filterItemRows(f) {
   const q = (f.q || "").toLowerCase();
-  let rows = activeItems(S.currentFund).filter((a) => a.status === (f.status || "active") || (!f.status && true));
-  if (f.status === "discontinued") rows = [...S.items.values()].filter((a) => a.fund === S.currentFund && a.status === "discontinued");
+  const fund = S.currentFund;
+  const status = f.status || "with_balance";
+  let rows;
+  if (status === "discontinued") {
+    rows = [...S.items.values()].filter((a) => a.fund === fund && a.status === "discontinued");
+  } else {
+    rows = activeItems(fund);
+    // The registry is the list of what is actually on the shelf: an item whose running balance
+    // has gone to zero (fully issued) drops out of the default view, but stays in the database
+    // and can be brought back with the "Zero balance" / "All" filter.
+    if (status === "with_balance") rows = rows.filter((a) => Math.abs(qtyBalance(a)) > 1e-9);
+    else if (status === "zero") rows = rows.filter((a) => Math.abs(qtyBalance(a)) <= 1e-9);
+  }
   if (q) rows = rows.filter((a) => [a.stock_no, a.description, a.item, a.account_name].some((v) => (v || "").toLowerCase().includes(q)));
   if (f.account) rows = rows.filter((a) => a.account_code === f.account);
   if (f.disposition) rows = rows.filter((a) => (isDistributionAccount(a.account_code) ? "distributed" : "consumed") === f.disposition);
@@ -651,44 +693,46 @@ function renderRegistry() {
   const f = S.registryFilter;
   const rows = filterItemRows(f);
   const canE = canEdit("registry");
+  const totalValue = rows.reduce((s, a) => s + costBalance(a), 0);
   document.getElementById("view-registry").innerHTML = `
+    <div class="panel small">One row per <b>Stock/Property No.</b> - every later delivery of the same stock number is filed <i>inside</i> that same item (open it to see each receipt and issuance), never as a second row. Items are created here only by posting an <b>AIR</b> to the registry, or by adding an opening balance for stock already on the shelf.</div>
     <div class="toolbar">
       <input class="grow" id="regSearch" placeholder="Search stock no., description..." value="${esc(f.q)}"/>
       <select id="regAccountFilter"><option value="">All accounts</option>${ACCOUNT_CATALOG.map((a) => `<option value="${a.code}" ${a.code === f.account ? "selected" : ""}>${esc(a.code)} - ${esc(a.name)}</option>`).join("")}</select>
-      <select id="regDispFilter">
-        <option value="" ${!f.disposition ? "selected" : ""}>Consumed + Distributed</option>
-        <option value="consumed" ${f.disposition === "consumed" ? "selected" : ""}>Consumed items</option>
-        <option value="distributed" ${f.disposition === "distributed" ? "selected" : ""}>Distributed items</option>
-      </select>
       <select id="regStatusFilter">
-        <option value="active" ${f.status === "active" ? "selected" : ""}>Active</option>
+        <option value="with_balance" ${f.status === "with_balance" ? "selected" : ""}>On hand (balance not zero)</option>
+        <option value="zero" ${f.status === "zero" ? "selected" : ""}>Zero balance</option>
+        <option value="all" ${f.status === "all" ? "selected" : ""}>All active items</option>
         <option value="discontinued" ${f.status === "discontinued" ? "selected" : ""}>Discontinued</option>
       </select>
       <div class="toolbar-right">
         <button class="btn" onclick="exportRegistryCsv()">Download CSV</button>
-        ${canE ? `<button class="btn primary" onclick="openItemModal()">+ Add item</button>` : ""}
+        ${canE ? `<button class="btn primary" onclick="openItemModal()">+ Add opening balance</button>` : ""}
       </div>
     </div>
+    <div class="cardrow" style="grid-template-columns: 1fr;">
+      <div class="card"><div class="label">Total value shown</div><div class="value">${fmtMoney(totalValue)}</div><div class="foot">${rows.length} item(s) &middot; ${esc(fundLabel(S.currentFund))}</div></div>
+    </div>
     <div class="table-wrap"><table>
-      <thead><tr><th>Stock No.</th><th>Description</th><th>Account</th><th>Type</th><th class="num">Balance Qty</th><th class="num">Value</th><th></th></tr></thead>
+      <thead><tr><th>Stock No.</th><th>Description</th><th>Account</th><th class="num">Receipts</th><th class="num">Balance Qty</th><th class="num">Value</th></tr></thead>
       <tbody>
-        ${rows.length ? rows.map((a) => `
+        ${rows.length ? rows.map((a) => {
+          const receipts = (a.ledger || []).filter((e) => e.type === "receipt").length;
+          return `
           <tr class="clickable" onclick="openItemDetail('${a.id}')">
             <td>${esc(a.stock_no)}</td>
-            <td>${esc(a.description)}<div class="small">${esc(a.item || "")}</div></td>
+            <td>${esc(a.description)}<div class="small">${esc(a.item || "")}</div>${isLowStock(a) ? ' <span class="pill check">Low stock</span>' : ""}</td>
             <td>${esc(a.account_code)}<div class="small">${esc(a.account_name || "")}</div></td>
-            <td><span class="pill ${isDistributionAccount(a.account_code) ? "distributed" : "consumed"}">${isDistributionAccount(a.account_code) ? "Distributed" : "Consumed"}</span>${isLowStock(a) ? ' <span class="pill check">Low stock</span>' : ""}</td>
+            <td class="num">${receipts}</td>
             <td class="num">${fmtNum(qtyBalance(a))} ${esc(a.unit)}</td>
             <td class="num">${fmtMoney(costBalance(a))}</td>
-            <td></td>
-          </tr>`).join("") : `<tr><td colspan="7"><div class="empty">No items match this filter.</div></td></tr>`}
+          </tr>`; }).join("") : `<tr><td colspan="6"><div class="empty">No items match this filter.</div></td></tr>`}
       </tbody>
     </table></div>`;
 
   const s = document.getElementById("regSearch");
   s.addEventListener("input", () => { S.registryFilter.q = s.value; renderRegistry(); });
   document.getElementById("regAccountFilter").addEventListener("change", (e) => { S.registryFilter.account = e.target.value; renderRegistry(); });
-  document.getElementById("regDispFilter").addEventListener("change", (e) => { S.registryFilter.disposition = e.target.value; renderRegistry(); });
   document.getElementById("regStatusFilter").addEventListener("change", (e) => { S.registryFilter.status = e.target.value; renderRegistry(); });
   restoreFocus(saved);
 }
@@ -697,8 +741,9 @@ function openItemModal(id) {
   if (!canEdit("registry")) { toast("You have view-only access to Inventory Registry.", true); return; }
   const a = id ? S.items.get(id) : null;
   openModal(`
-    <div class="modal-head"><h3>${a ? "Edit item" : "+ Add item"}</h3><button class="btn ghost" onclick="closeModal()">✕</button></div>
+    <div class="modal-head"><h3>${a ? "Edit item" : "+ Add opening balance"}</h3><button class="btn ghost" onclick="closeModal()">✕</button></div>
     <div class="modal-body">
+      ${!a ? `<div class="panel small" style="margin-bottom:12px;">Use this only to onboard stock that is <b>already on the shelf</b> before this system started. New deliveries come in through an <b>AIR</b> instead. If the Stock No. you type already exists in this fund, the opening balance is filed inside that existing item.</div>` : ""}
       <div class="grid2">
         <div><label>Account</label><select id="f_account">${accountOptionsHtml(a && a.account_code)}</select></div>
         <div><label>Stock No.</label><input id="f_stockno" value="${esc(a ? a.stock_no : "")}"/></div>
@@ -722,7 +767,7 @@ function openItemModal(id) {
     </div>
     <div class="modal-foot">
       <button class="btn ghost" onclick="closeModal()">Cancel</button>
-      <button class="btn primary" onclick="saveItem('${a ? a.id : ""}')">${a ? "Save" : "Add item"}</button>
+      <button class="btn primary" onclick="saveItem('${a ? a.id : ""}')">${a ? "Save" : "Add opening balance"}</button>
     </div>`);
   const accSel = document.getElementById("f_account");
   accSel.addEventListener("change", () => {
@@ -759,20 +804,30 @@ function saveItem(id) {
   };
   if (id) {
     colItems.doc(id).update(rec).then(() => { toast("Item saved."); closeModal(); }).catch((e) => toast(e.message, true));
-  } else {
-    rec.created_at = Date.now();
-    rec.ledger = [];
-    const openQtyEl = document.getElementById("f_openqty");
-    const openQty = openQtyEl ? Number(openQtyEl.value) || 0 : 0;
-    if (openQty > 0) {
-      rec.ledger.push({
-        id: uid(), type: "receipt", date: document.getElementById("f_openat").value || todayStr(),
-        ref: "Opening balance", qty: openQty, unit_cost: rec.unit_cost, total_cost: round2(openQty * rec.unit_cost),
-        by: S.currentUser.email, at: Date.now(),
-      });
-    }
-    colItems.doc().set(rec).then(() => { toast("Item added."); closeModal(); }).catch((e) => toast(e.message, true));
+    return;
   }
+  const openQtyEl = document.getElementById("f_openqty");
+  const openQty = openQtyEl ? Number(openQtyEl.value) || 0 : 0;
+  const openDate = (document.getElementById("f_openat") || {}).value || todayStr();
+  const entry = openQty > 0 ? {
+    id: uid(), type: "receipt", date: openDate,
+    ref: "Opening balance", qty: openQty, unit_cost: rec.unit_cost, total_cost: round2(openQty * rec.unit_cost),
+    by: S.currentUser.email, at: Date.now(),
+  } : null;
+  // One row per Stock No. per fund: if this stock number is already in the registry, the opening
+  // balance is filed inside that existing item instead of creating a second row for it.
+  const existing = itemByStockNo(S.currentFund, stock_no);
+  if (existing) {
+    if (!entry) { toast(`Stock No. ${stock_no} already exists in this fund.`, true); return; }
+    const ledger = (existing.ledger || []).concat([entry]);
+    colItems.doc(existing.id).update({ ledger, unit_cost: rec.unit_cost, status: "active", updated_at: Date.now() })
+      .then(() => { toast(`Opening balance filed inside the existing item ${stock_no}.`); closeModal(); })
+      .catch((e) => toast(e.message, true));
+    return;
+  }
+  rec.created_at = Date.now();
+  rec.ledger = entry ? [entry] : [];
+  colItems.doc().set(rec).then(() => { toast("Item added."); closeModal(); }).catch((e) => toast(e.message, true));
 }
 
 function round2(n) { return Math.round((Number(n) || 0) * 100) / 100; }
@@ -794,11 +849,14 @@ function openItemDetail(id) {
   if (!a) return;
   const bal = itemRunningTotals(a);
   const canE = canEdit("registry");
+  const receipts = (a.ledger || []).filter((e) => e.type === "receipt").length;
+  const issues = (a.ledger || []).filter((e) => e.type === "issue").length;
   const rowsHtml = bal.rows.slice().reverse().map((r) => `
-    <tr>
+    <tr${r.air_id || r.ris_id ? ` class="clickable" onclick="closeModal();${r.air_id ? `openAirDetail('${r.air_id}')` : `openRisDetail('${r.ris_id}')`}"` : ""}>
       <td>${fmtDate(r.date)}</td><td>${esc(r.ref || "")}</td>
-      <td>${r.type === "receipt" ? '<span class="pill ok">Receipt</span>' : `<span class="pill ${r.disposition === "distributed" ? "distributed" : "consumed"}">${r.disposition === "distributed" ? "Distributed" : "Consumed"}</span>`}</td>
+      <td>${r.type === "receipt" ? '<span class="pill ok">Receipt</span>' : `<span class="pill ${r.disposition === "distributed" ? "distributed" : "consumed"}">${r.disposition === "distributed" ? "Distribution" : "Consumption"}</span>`}</td>
       <td class="num">${r.type === "receipt" ? "+" : "-"}${fmtNum(r.qty)}</td>
+      <td class="num">${fmtNum(r.unit_cost)}</td>
       <td class="num">${fmtMoney(r.total_cost)}</td>
       <td class="num">${fmtNum(r.run_qty)}</td>
       <td>${esc(r.office || r.recipient || "")}</td>
@@ -817,52 +875,17 @@ function openItemDetail(id) {
         <div><b>Re-order point</b><br/>${fmtNum(a.reorder_point)} ${isLowStock(a) ? '<span class="pill check">Low stock</span>' : ""}</div>
       </div>
       <div class="hr"></div>
-      <h3 style="font-size:13px;">Movement history</h3>
-      <div class="table-wrap"><table><thead><tr><th>Date</th><th>Reference</th><th>Type</th><th class="num">Qty</th><th class="num">Amount</th><th class="num">Balance</th><th>Office/Recipient</th></tr></thead>
-      <tbody>${rowsHtml || '<tr><td colspan="7"><div class="empty">No movement yet.</div></td></tr>'}</tbody></table></div>
+      <h3 style="font-size:13px;">Movement history <span class="small" style="font-weight:normal;">- ${receipts} receipt(s) from AIR, ${issues} issuance(s) from RIS, all filed under this one stock number</span></h3>
+      <div class="table-wrap"><table><thead><tr><th>Date</th><th>Reference</th><th>Type</th><th class="num">Qty</th><th class="num">Unit Cost</th><th class="num">Amount</th><th class="num">Balance</th><th>Office/Recipient</th></tr></thead>
+      <tbody>${rowsHtml || '<tr><td colspan="8"><div class="empty">No movement yet.</div></td></tr>'}</tbody></table></div>
+      <p class="small" style="margin-top:10px;">New stock is added by posting an <b>Acceptance and Inspection Report</b> to the registry, not by editing this item.</p>
     </div>
     <div class="modal-foot">
-      ${a.status === "discontinued" ? (canE ? `<button class="btn" onclick="reactivateItem('${a.id}')">Reactivate</button>` : "") : (canE ? `<button class="btn" onclick="openReceiptModal('${a.id}')">+ Record receipt</button><button class="btn danger" onclick="discontinueItem('${a.id}')">Discontinue</button>` : "")}
+      ${a.status === "discontinued" ? (canE ? `<button class="btn" onclick="reactivateItem('${a.id}')">Reactivate</button>` : "") : (canE ? `<button class="btn danger" onclick="discontinueItem('${a.id}')">Discontinue</button>` : "")}
       <button class="btn" onclick="printSlc('${a.id}')">Print SLC</button>
       <button class="btn" onclick="printSc('${a.id}')">Print Stock Card</button>
       ${canE ? `<button class="btn primary" onclick="closeModal();openItemModal('${a.id}')">Edit</button>` : ""}
     </div>`, "wide");
-}
-
-function openReceiptModal(itemId) {
-  if (blockIfViewOnly("registry")) return;
-  const a = S.items.get(itemId);
-  openModal(`
-    <div class="modal-head"><h3>Record receipt - ${esc(a.description)}</h3><button class="btn ghost" onclick="closeModal()">✕</button></div>
-    <div class="modal-body">
-      <div class="grid2">
-        <div><label>Date</label><input id="rc_date" type="date" value="${todayStr()}"/></div>
-        <div><label>Reference (DV No. / PO No.)</label><input id="rc_ref"/></div>
-      </div>
-      <div class="grid2">
-        <div><label>Quantity received</label><input id="rc_qty" type="number" step="0.01" value="0"/></div>
-        <div><label>Unit cost (Php)</label><input id="rc_unitcost" type="number" step="0.01" value="${a.unit_cost}"/></div>
-      </div>
-      <label>Remarks</label><input id="rc_remarks"/>
-    </div>
-    <div class="modal-foot">
-      <button class="btn ghost" onclick="closeModal()">Cancel</button>
-      <button class="btn primary" onclick="saveReceipt('${itemId}')">Save receipt</button>
-    </div>`);
-}
-function saveReceipt(itemId) {
-  if (blockIfViewOnly("registry")) return;
-  const a = S.items.get(itemId);
-  const qty = Number(document.getElementById("rc_qty").value) || 0;
-  const unit_cost = Number(document.getElementById("rc_unitcost").value) || 0;
-  if (qty <= 0) { toast("Quantity must be greater than zero.", true); return; }
-  const entry = {
-    id: uid(), type: "receipt", date: document.getElementById("rc_date").value || todayStr(),
-    ref: document.getElementById("rc_ref").value.trim(), qty, unit_cost, total_cost: round2(qty * unit_cost),
-    remarks: document.getElementById("rc_remarks").value.trim(), by: S.currentUser.email, at: Date.now(),
-  };
-  const ledger = (a.ledger || []).concat([entry]);
-  colItems.doc(itemId).update({ ledger, unit_cost }).then(() => { toast("Receipt recorded."); closeModal(); openItemDetail(itemId); }).catch((e) => toast(e.message, true));
 }
 
 function printSlc(id) { openPrintWindow(slcHtml(S.items.get(id)), "landscape"); }
@@ -881,14 +904,25 @@ function exportRegistryCsv() {
 }
 
 // ---------------------------------------------------------------------
-// RIS - Requisition and Issue Slip
+// RIS - Requisition and Issue Slip. The single issuance document in the system: every release of
+// stock goes through a RIS, tagged either Consumption (used internally by an office) or
+// Distribution (given out to a barangay, beneficiary, or the public, with a recipient recorded).
+// Draft -> Issue (deducts stock) -> reversible.
 // ---------------------------------------------------------------------
+
+function risIssuedTo(r) {
+  if (r.issue_type === "distribution") {
+    return [r.recipient_name, r.recipient_barangay].filter(Boolean).join(" / ") || r.office || r.department || "";
+  }
+  return r.office || r.department || "";
+}
 
 function filterRisRows(f) {
   const q = (f.q || "").toLowerCase();
   let rows = [...S.ris.values()].filter((r) => r.fund === S.currentFund);
   if (f.status) rows = rows.filter((r) => r.status === f.status);
-  if (q) rows = rows.filter((r) => [r.ris_no, r.department, r.office, r.purpose].some((v) => (v || "").toLowerCase().includes(q)));
+  if (f.type) rows = rows.filter((r) => (r.issue_type || "consumption") === f.type);
+  if (q) rows = rows.filter((r) => [r.ris_no, r.department, r.office, r.purpose, r.recipient_name, r.recipient_barangay].some((v) => (v || "").toLowerCase().includes(q)));
   rows.sort((a, b) => (b.ris_no || "").localeCompare(a.ris_no || ""));
   return rows;
 }
@@ -900,7 +934,11 @@ function renderRis() {
   const canE = canEdit("ris");
   document.getElementById("view-ris").innerHTML = `
     <div class="toolbar">
-      <input class="grow" id="risSearch" placeholder="Search RIS no., office, purpose..." value="${esc(f.q)}"/>
+      <input class="grow" id="risSearch" placeholder="Search RIS no., office, recipient, purpose..." value="${esc(f.q)}"/>
+      <select id="risTypeFilter">
+        <option value="" ${!f.type ? "selected" : ""}>All types</option>
+        ${ISSUE_TYPES.map((t) => `<option value="${t.code}" ${f.type === t.code ? "selected" : ""}>${esc(t.label)}</option>`).join("")}
+      </select>
       <select id="risStatusFilter">
         <option value="" ${!f.status ? "selected" : ""}>All statuses</option>
         <option value="draft" ${f.status === "draft" ? "selected" : ""}>Draft</option>
@@ -908,19 +946,23 @@ function renderRis() {
       </select>
       <div class="toolbar-right">
         <button class="btn" onclick="exportRisCsv()">Download CSV</button>
-        ${canE ? `<button class="btn primary" onclick="openRisModal()">+ New RIS</button>` : ""}
+        ${canE ? `<button class="btn" onclick="openBulkRisModal()">⇪ Bulk upload</button><button class="btn primary" onclick="openRisModal()">+ New RIS</button>` : ""}
       </div>
     </div>
     <div class="table-wrap"><table>
-      <thead><tr><th>RIS No.</th><th>Date</th><th>Department / Office</th><th>Purpose</th><th>Status</th></tr></thead>
+      <thead><tr><th>RIS No.</th><th>Date</th><th>Type</th><th>Issued to</th><th>Purpose</th><th class="num">Lines</th><th>Status</th></tr></thead>
       <tbody>${rows.length ? rows.map((r) => `
         <tr class="clickable" onclick="openRisDetail('${r.id}')">
-          <td>${esc(r.ris_no)}</td><td>${fmtDate(r.date)}</td><td>${esc(r.department)}${r.office ? " / " + esc(r.office) : ""}</td>
+          <td>${esc(r.ris_no)}</td><td>${fmtDate(r.date)}</td>
+          <td><span class="pill ${r.issue_type === "distribution" ? "distributed" : "consumed"}">${esc(issueTypeLabel(r.issue_type))}</span></td>
+          <td>${esc(risIssuedTo(r))}</td>
           <td>${esc(r.purpose || "")}</td>
+          <td class="num">${(r.lines || []).length}</td>
           <td><span class="pill ${r.status === "issued" ? "ok" : "muted"}">${r.status === "issued" ? "Issued" : "Draft"}</span></td>
-        </tr>`).join("") : `<tr><td colspan="5"><div class="empty">No RIS records match this filter.</div></td></tr>`}</tbody>
+        </tr>`).join("") : `<tr><td colspan="7"><div class="empty">No RIS records match this filter.</div></td></tr>`}</tbody>
     </table></div>`;
   document.getElementById("risSearch").addEventListener("input", (e) => { S.risFilter.q = e.target.value; renderRis(); });
+  document.getElementById("risTypeFilter").addEventListener("change", (e) => { S.risFilter.type = e.target.value; renderRis(); });
   document.getElementById("risStatusFilter").addEventListener("change", (e) => { S.risFilter.status = e.target.value; renderRis(); });
   restoreFocus(saved);
 }
@@ -930,7 +972,7 @@ function risLineRowHtml(l, idx) {
   return `<tr data-idx="${idx}">
     <td><select class="ris_line_item" data-idx="${idx}">
       <option value="">-- pick item --</option>
-      ${activeItems(S.currentFund).map((a) => `<option value="${a.id}" ${a.id === l.item_id ? "selected" : ""}>${esc(a.stock_no)} - ${esc(a.description)}</option>`).join("")}
+      ${issuableItems(S.currentFund).map((a) => `<option value="${a.id}" ${a.id === l.item_id ? "selected" : ""}>${esc(a.stock_no)} - ${esc(a.description)} (${fmtNum(qtyBalance(a))} ${esc(a.unit)})</option>`).join("")}
     </select></td>
     <td>${esc(item ? item.unit : l.unit || "")}</td>
     <td><input class="ris_line_qtyreq" data-idx="${idx}" type="number" step="0.01" value="${l.qty_requested || 0}"/></td>
@@ -938,6 +980,12 @@ function risLineRowHtml(l, idx) {
     <td><input class="ris_line_remarks" data-idx="${idx}" value="${esc(l.remarks || "")}"/></td>
     <td><button class="btn ghost" onclick="removeRisLine(${idx})">✕</button></td>
   </tr>`;
+}
+
+// Only stock that is actually on hand can be issued - plus whatever this draft already points at,
+// so an existing line never silently disappears from its own dropdown.
+function issuableItems(fund) {
+  return activeItems(fund).filter((a) => Math.abs(qtyBalance(a)) > 1e-9 || _risDraftLines.some((l) => l.item_id === a.id));
 }
 
 let _risDraftLines = [];
@@ -949,22 +997,36 @@ function renderRisLinesTable() {
   body.innerHTML = _risDraftLines.map((l, i) => risLineRowHtml(l, i)).join("");
 }
 
+function toggleRisRecipientFields() {
+  const wrap = document.getElementById("risRecipientWrap");
+  if (!wrap) return;
+  wrap.hidden = document.getElementById("ris_type").value !== "distribution";
+}
+
 function openRisModal(id) {
   if (!canEdit("ris")) { toast("You have view-only access to RIS.", true); return; }
   const r = id ? S.ris.get(id) : null;
   _risDraftLines = r ? (r.lines || []).map((l) => ({ ...l })) : [{}];
   const suggested = r ? r.ris_no : nextDocNumber(S.ris, S.currentFund, todayStr(), "ris_no");
+  const type = r ? r.issue_type || "consumption" : "consumption";
   openModal(`
     <div class="modal-head"><h3>${r ? "Edit RIS" : "New RIS"}</h3><button class="btn ghost" onclick="closeModal()">✕</button></div>
     <div class="modal-body">
       <div class="grid3">
         <div><label>RIS No.</label><input id="ris_no" value="${esc(suggested)}"/></div>
         <div><label>Date</label><input id="ris_date" type="date" value="${r ? r.date : todayStr()}"/></div>
-        <div><label>FPP Code</label><input id="ris_fpp" value="${esc(r ? r.fpp_code || "" : "")}"/></div>
+        <div><label>Type of issuance</label><select id="ris_type" onchange="toggleRisRecipientFields()">
+          ${ISSUE_TYPES.map((t) => `<option value="${t.code}" ${type === t.code ? "selected" : ""}>${esc(t.label)}</option>`).join("")}
+        </select></div>
       </div>
-      <div class="grid2">
+      <div class="grid3">
         <div><label>Department</label><input id="ris_dept" value="${esc(r ? r.department : "")}"/></div>
         <div><label>Office</label><input id="ris_office" value="${esc(r ? r.office || "" : "")}"/></div>
+        <div><label>FPP Code</label><input id="ris_fpp" value="${esc(r ? r.fpp_code || "" : "")}"/></div>
+      </div>
+      <div class="grid2" id="risRecipientWrap" ${type === "distribution" ? "" : "hidden"}>
+        <div><label>Recipient (name / group)</label><input id="ris_recipient" value="${esc(r ? r.recipient_name || "" : "")}"/></div>
+        <div><label>Barangay / Address</label><input id="ris_barangay" value="${esc(r ? r.recipient_barangay || "" : "")}"/></div>
       </div>
       <div class="hr"></div>
       <table class="line-table"><thead><tr><th>Item</th><th>Unit</th><th>Qty Requested</th><th>Qty Issued</th><th>Remarks</th><th></th></tr></thead>
@@ -1015,7 +1077,6 @@ function collectRisLines() {
     qty_requested: Number(l.qty_requested) || 0,
     qty_issued: l.qty_issued == null ? null : Number(l.qty_issued),
     remarks: l.remarks || "",
-    disposition: l.disposition || null, recipient: l.recipient || "",
   }));
 }
 
@@ -1024,12 +1085,19 @@ function saveRis(id, markIssue) {
   const ris_no = document.getElementById("ris_no").value.trim();
   const fund = S.currentFund;
   if (numberTaken(S.ris, fund, "ris_no", ris_no, id)) { toast(`RIS No. ${ris_no} is already used in this fund.`, true); return; }
+  const issue_type = document.getElementById("ris_type").value;
   const department = document.getElementById("ris_dept").value.trim();
-  if (!department) { toast("Department is required.", true); return; }
+  const recipient_name = document.getElementById("ris_recipient").value.trim();
+  if (issue_type === "distribution") {
+    if (!recipient_name) { toast("A Distribution RIS needs a Recipient.", true); return; }
+  } else if (!department) { toast("Department is required.", true); return; }
   const rec = {
     fund, ris_no, date: document.getElementById("ris_date").value || todayStr(),
+    issue_type,
     fpp_code: document.getElementById("ris_fpp").value.trim(),
     department, office: document.getElementById("ris_office").value.trim(),
+    recipient_name,
+    recipient_barangay: document.getElementById("ris_barangay").value.trim(),
     lines: collectRisLines(),
     purpose: document.getElementById("ris_purpose").value.trim(),
     requested_by_name: document.getElementById("ris_req_name").value.trim(),
@@ -1056,25 +1124,27 @@ function openRisDetail(id) {
   const r = S.ris.get(id);
   if (!r) return;
   const canE = canEdit("ris");
-  const rows = (r.lines || []).map((l) => {
-    return `<tr>
+  const rows = (r.lines || []).map((l) => `<tr>
       <td>${esc(l.stock_no)}</td><td>${esc(l.description)}</td>
       <td class="num">${fmtNum(l.qty_requested)}</td>
       <td class="num">${l.qty_issued != null ? fmtNum(l.qty_issued) : "—"}</td>
-    </tr>`;
-  }).join("");
+      <td>${esc(l.remarks || "")}</td>
+    </tr>`).join("");
   openModal(`
     <div class="modal-head"><h3>RIS ${esc(r.ris_no)}</h3><button class="btn ghost" onclick="closeModal()">✕</button></div>
     <div class="modal-body">
       <div class="grid3 small">
         <div><b>Date</b><br/>${fmtDate(r.date)}</div>
-        <div><b>Department/Office</b><br/>${esc(r.department)}${r.office ? " / " + esc(r.office) : ""}</div>
+        <div><b>Type</b><br/><span class="pill ${r.issue_type === "distribution" ? "distributed" : "consumed"}">${esc(issueTypeLabel(r.issue_type))}</span></div>
         <div><b>Status</b><br/><span class="pill ${r.status === "issued" ? "ok" : "muted"}">${r.status === "issued" ? "Issued" : "Draft"}</span></div>
       </div>
+      <div class="grid2 small" style="margin-top:8px;">
+        <div><b>Department/Office</b><br/>${esc(r.department || "")}${r.office ? " / " + esc(r.office) : ""}</div>
+        <div><b>${r.issue_type === "distribution" ? "Recipient" : "Issued to"}</b><br/>${esc(risIssuedTo(r))}</div>
+      </div>
       <div class="hr"></div>
-      <div class="table-wrap"><table><thead><tr><th>Stock No.</th><th>Description</th><th class="num">Qty Req.</th><th class="num">Qty Issued</th></tr></thead><tbody>${rows}</tbody></table></div>
+      <div class="table-wrap"><table><thead><tr><th>Stock No.</th><th>Description</th><th class="num">Qty Req.</th><th class="num">Qty Issued</th><th>Remarks</th></tr></thead><tbody>${rows}</tbody></table></div>
       <p class="small" style="margin-top:10px;"><b>Purpose:</b> ${esc(r.purpose || "")}</p>
-      <p class="small">RIS is used for <b>Consumed Inventory</b> only - issued stock is recorded as used internally by the requesting office. For issuances to a barangay, beneficiary, or the public, use an <b>Acknowledgement Receipt</b> instead.</p>
     </div>
     <div class="modal-foot">
       <button class="btn" onclick="printRis('${r.id}')">Print RIS</button>
@@ -1097,14 +1167,19 @@ function openIssueRisModal(id) {
   openModal(`
     <div class="modal-head"><h3>Issue RIS ${esc(r.ris_no)}</h3><button class="btn ghost" onclick="closeModal()">✕</button></div>
     <div class="modal-body">
-      <p class="small">Confirm the quantity actually issued for each line. This deducts stock immediately and records it as <b>Consumed</b> by ${esc(r.office || r.department)} - it cannot be edited afterward (only reversed).</p>
-      <table class="line-table"><thead><tr><th>Item</th><th class="num">Qty Req.</th><th>Qty Issued</th></tr></thead>
+      <p class="small">Confirm the quantity actually issued for each line. This deducts stock immediately and records it as
+        <b>${esc(issueTypeLabel(r.issue_type))}</b> to <b>${esc(risIssuedTo(r))}</b> - it cannot be edited afterward (only reversed).</p>
+      <table class="line-table"><thead><tr><th>Item</th><th class="num">On hand</th><th class="num">Qty Req.</th><th>Qty Issued</th></tr></thead>
       <tbody>
-        ${(r.lines || []).map((l, i) => `<tr>
+        ${(r.lines || []).map((l, i) => {
+          const item = S.items.get(l.item_id);
+          return `<tr>
             <td>${esc(l.stock_no)} - ${esc(l.description)}</td>
+            <td class="num">${item ? fmtNum(qtyBalance(item)) + " " + esc(item.unit) : "—"}</td>
             <td class="num">${fmtNum(l.qty_requested)}</td>
             <td><input class="iss_qty" data-idx="${i}" type="number" step="0.01" value="${l.qty_issued != null ? l.qty_issued : l.qty_requested}"/></td>
-          </tr>`).join("")}
+          </tr>`;
+        }).join("")}
       </tbody></table>
     </div>
     <div class="modal-foot">
@@ -1118,15 +1193,16 @@ function confirmIssueRis(id) {
   const r = S.ris.get(id);
   const lines = (r.lines || []).map((l, i) => {
     const qtyEl = document.querySelector(`.iss_qty[data-idx="${i}"]`);
-    return { ...l, qty_issued: Number(qtyEl.value) || 0, disposition: "consumed", recipient: "" };
+    return { ...l, qty_issued: Number(qtyEl.value) || 0 };
   });
-  // Validate stock availability first.
   for (const l of lines) {
     const item = S.items.get(l.item_id);
     if (!item) continue;
     if (l.qty_issued > qtyBalance(item) + 1e-6) { toast(`Not enough stock for ${item.description} (balance ${fmtNum(qtyBalance(item))} ${item.unit}).`, true); return; }
   }
-  const office = r.office || r.department;
+  const disposition = issueTypeInfo(r.issue_type).disposition;
+  const office = r.office || r.department || "";
+  const recipient = r.issue_type === "distribution" ? risIssuedTo(r) : "";
   const writes = [];
   for (const l of lines) {
     if (l.qty_issued <= 0) continue;
@@ -1136,7 +1212,7 @@ function confirmIssueRis(id) {
     const entry = {
       id: uid(), type: "issue", date: r.date, ref: r.ris_no,
       qty: l.qty_issued, unit_cost: uc, total_cost: round2(l.qty_issued * uc),
-      office, disposition: "consumed", ris_id: r.id,
+      office, disposition, recipient, ris_id: r.id,
       by: S.currentUser.email, at: Date.now(),
     };
     const ledger = (item.ledger || []).concat([entry]);
@@ -1144,7 +1220,7 @@ function confirmIssueRis(id) {
   }
   Promise.all(writes)
     .then(() => colRis.doc(id).update({ lines, status: "issued", issued_at: Date.now(), issued_by_email: S.currentUser.email }))
-    .then(() => { toast("RIS issued - stock updated (Consumed Inventory)."); closeModal(); })
+    .then(() => { toast(`RIS issued - stock updated (${issueTypeLabel(r.issue_type)}).`); closeModal(); })
     .catch((e) => toast(e.message, true));
 }
 
@@ -1169,306 +1245,534 @@ function printRis(id) { openPrintWindow(risHtml(S.ris.get(id)), "portrait"); }
 
 function exportRisCsv() {
   const rows = filterRisRows(S.risFilter);
-  const header = ["RIS No.", "Date", "Department", "Office", "Purpose", "Status", "Stock No.", "Description", "Qty Requested", "Qty Issued"];
+  const header = ["RIS No.", "Date", "Type", "Department", "Office", "Recipient", "Barangay", "Purpose", "Status", "Stock No.", "Description", "Qty Requested", "Qty Issued", "Remarks"];
   const lines = [header.join(",")];
   for (const r of rows) {
     for (const l of r.lines || []) {
-      lines.push([r.ris_no, r.date, r.department, r.office, r.purpose, r.status, l.stock_no, l.description, l.qty_requested, l.qty_issued].map(csvField).join(","));
+      lines.push([r.ris_no, r.date, issueTypeLabel(r.issue_type), r.department, r.office, r.recipient_name, r.recipient_barangay,
+        r.purpose, r.status, l.stock_no, l.description, l.qty_requested, l.qty_issued, l.remarks].map(csvField).join(","));
     }
   }
   browserDownload(`RIS_${S.currentFund}_${todayStr()}.csv`, lines.join("\n"), "text/csv");
 }
 
 // ---------------------------------------------------------------------
-// Acknowledgement Receipt (AR) - used whenever inventory is given out to a barangay, beneficiary,
-// or the public (Distributed Inventory). Mirrors the RIS draft -> issue -> reverse lifecycle, but
-// there is no official COA form for this - MGO Candoni had no reference to match, so this is a
-// reasonable design based on standard LGU distribution-record practice (recipient, items,
-// quantities, date, and three signature blocks).
+// Bulk RIS upload - one spreadsheet, many RIS. Each row is one item line; rows that share a
+// RIS No. are folded into a single RIS. Everything imports as a Draft, so nothing touches stock
+// until each RIS is reviewed and Issued in the normal way.
 // ---------------------------------------------------------------------
 
-function filterArRows(f) {
+const BULK_RIS_HEADERS = ["RIS No.", "Date", "Type", "Department", "Office", "Recipient", "Barangay", "FPP Code", "Purpose", "Stock No.", "Qty Requested", "Qty Issued", "Remarks"];
+let _bulkRisParsed = null;
+
+function downloadRisTemplate() {
+  const sample = [
+    ["2026-09-0001", todayStr(), "Consumption", "Municipal Treasurer's Office", "MTO", "", "", "", "Office supplies for the quarter", "OS-0001", "20", "20", ""],
+    ["2026-09-0002", todayStr(), "Distribution", "Rural Health Unit", "RHU", "Brgy. Captain Dela Cruz", "Barangay Poblacion", "", "Medicine distribution", "MED-0001", "50", "50", ""],
+  ];
+  const lines = [BULK_RIS_HEADERS.join(",")].concat(sample.map((r) => r.map(csvField).join(",")));
+  browserDownload("RIS_bulk_upload_template.csv", lines.join("\n"), "text/csv");
+}
+
+function openBulkRisModal() {
+  if (!canEdit("ris")) { toast("You have view-only access to RIS.", true); return; }
+  _bulkRisParsed = null;
+  openModal(`
+    <div class="modal-head"><h3>Bulk upload RIS</h3><button class="btn ghost" onclick="closeModal()">✕</button></div>
+    <div class="modal-body">
+      <p class="small">One row per item line. Rows sharing the same <b>RIS No.</b> become a single RIS. <b>Stock No.</b> must already exist in the Inventory Registry for ${esc(fundLabel(S.currentFund))}. Everything imports as a <b>Draft</b> - stock only moves when you Issue each RIS.</p>
+      <p class="small"><b>Columns:</b> ${BULK_RIS_HEADERS.join(" &middot; ")}</p>
+      <button class="btn" onclick="downloadRisTemplate()">⇩ Download blank template (CSV)</button>
+      <div class="hr"></div>
+      <label>Upload a file (.xlsx / .xls / .csv)</label><input id="bulkRisFile" type="file" accept=".xlsx,.xls,.csv"/>
+      <label>...or paste rows (tab- or comma-delimited, header row optional)</label>
+      <textarea id="bulkRisPaste" rows="7" placeholder="RIS No.&#9;Date&#9;Type&#9;Department&#9;Office&#9;Recipient&#9;Barangay&#9;FPP Code&#9;Purpose&#9;Stock No.&#9;Qty Requested&#9;Qty Issued&#9;Remarks"></textarea>
+      <div id="bulkRisPreview"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn" onclick="previewBulkRis()">Check rows</button>
+      <button class="btn primary" onclick="importBulkRis()">Import as drafts</button>
+    </div>`, "wide");
+  const fileEl = document.getElementById("bulkRisFile");
+  fileEl.addEventListener("change", () => {
+    const file = fileEl.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const wb = window.XLSX.read(ev.target.result, { type: "array" });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        const rowsArr = window.XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: "" });
+        document.getElementById("bulkRisPaste").value = rowsArr.map((r) => (r || []).slice(0, BULK_RIS_HEADERS.length).join("\t")).join("\n");
+        previewBulkRis();
+      } catch (e) { toast("Could not read that file.", true); }
+    };
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+function parseBulkRisText(text) {
+  const fund = S.currentFund;
+  const errors = [];
+  const byNo = new Map();
+  const rawLines = text.split("\n").map((l) => l.replace(/\r$/, "")).filter((l) => l.trim());
+  rawLines.forEach((line, i) => {
+    const cells = (line.includes("\t") ? line.split("\t") : splitCsvLine(line)).map((c) => c.trim());
+    if (!cells[0]) return;
+    if (i === 0 && cells[0].toLowerCase().replace(/[^a-z]/g, "") === "risno") return; // header row
+    const [ris_no, date, typeRaw, department, office, recipient, barangay, fpp, purpose, stock_no, qtyReq, qtyIss, remarks] = cells;
+    const rowNo = i + 1;
+    const type = (typeRaw || "").toLowerCase().startsWith("d") ? "distribution" : "consumption";
+    const item = itemByStockNo(fund, stock_no);
+    if (!stock_no) { errors.push(`Row ${rowNo}: no Stock No.`); return; }
+    if (!item) { errors.push(`Row ${rowNo}: Stock No. "${stock_no}" is not in the ${fundLabel(fund)} registry.`); return; }
+    if (numberTaken(S.ris, fund, "ris_no", ris_no, null)) { errors.push(`Row ${rowNo}: RIS No. ${ris_no} already exists in this fund.`); return; }
+    if (type === "distribution" && !recipient) { errors.push(`Row ${rowNo}: a Distribution row needs a Recipient.`); return; }
+    const rec = byNo.get(ris_no) || {
+      fund, ris_no, date: date || todayStr(), issue_type: type,
+      department: department || "", office: office || "",
+      recipient_name: recipient || "", recipient_barangay: barangay || "",
+      fpp_code: fpp || "", purpose: purpose || "",
+      lines: [], status: "draft",
+    };
+    rec.lines.push({
+      id: uid(), item_id: item.id, stock_no: item.stock_no, description: item.description, unit: item.unit,
+      qty_requested: Number(qtyReq) || 0,
+      qty_issued: qtyIss === "" || qtyIss == null ? null : Number(qtyIss) || 0,
+      remarks: remarks || "",
+    });
+    byNo.set(ris_no, rec);
+  });
+  return { records: [...byNo.values()], errors };
+}
+
+function splitCsvLine(line) {
+  const out = [];
+  let cur = "", inQ = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (inQ) {
+      if (c === '"' && line[i + 1] === '"') { cur += '"'; i++; }
+      else if (c === '"') inQ = false;
+      else cur += c;
+    } else if (c === '"') inQ = true;
+    else if (c === ",") { out.push(cur); cur = ""; }
+    else cur += c;
+  }
+  out.push(cur);
+  return out;
+}
+
+function previewBulkRis() {
+  const text = document.getElementById("bulkRisPaste").value;
+  if (!text.trim()) { toast("Paste some rows or pick a file first.", true); return null; }
+  const { records, errors } = parseBulkRisText(text);
+  _bulkRisParsed = records;
+  const wrap = document.getElementById("bulkRisPreview");
+  wrap.innerHTML = `
+    <div class="hr"></div>
+    <h3 style="font-size:13px;">${records.length} RIS ready &middot; ${records.reduce((s, r) => s + r.lines.length, 0)} line(s)${errors.length ? ` &middot; ${errors.length} row(s) skipped` : ""}</h3>
+    ${records.length ? `<div class="table-wrap"><table><thead><tr><th>RIS No.</th><th>Date</th><th>Type</th><th>Issued to</th><th class="num">Lines</th></tr></thead><tbody>
+      ${records.map((r) => `<tr><td>${esc(r.ris_no)}</td><td>${fmtDate(r.date)}</td>
+        <td><span class="pill ${r.issue_type === "distribution" ? "distributed" : "consumed"}">${esc(issueTypeLabel(r.issue_type))}</span></td>
+        <td>${esc(risIssuedTo(r))}</td><td class="num">${r.lines.length}</td></tr>`).join("")}
+    </tbody></table></div>` : ""}
+    ${errors.length ? `<div class="panel small" style="margin-top:10px;"><b>Skipped rows</b><br/>${errors.map(esc).join("<br/>")}</div>` : ""}`;
+  return records;
+}
+
+function importBulkRis() {
+  if (blockIfViewOnly("ris")) return;
+  const records = _bulkRisParsed || previewBulkRis();
+  if (!records || !records.length) { toast("Nothing to import - check the rows first.", true); return; }
+  const writes = records.map((rec) => colRis.doc().set({ ...rec, created_at: Date.now(), updated_at: Date.now(), created_by: S.currentUser.email }));
+  Promise.all(writes)
+    .then(() => { toast(`${records.length} RIS imported as drafts.`); closeModal(); })
+    .catch((e) => toast(e.message, true));
+}
+
+// ---------------------------------------------------------------------
+// AIR - Acceptance and Inspection Report. Every delivery lands here first: the Supply/Property
+// Custodian accepts it and the Inspection Officer inspects it, and the AIR sits as "For
+// Accounting" until Accounting posts it to the Inventory Registry ("Received in Accounting"),
+// which is what actually creates/updates the registry item and its stock balance. Posting is
+// reversible (Unpost) - it strips exactly this AIR's receipt entries back out again.
+// ---------------------------------------------------------------------
+
+function filterAirRows(f) {
   const q = (f.q || "").toLowerCase();
-  let rows = [...S.ar.values()].filter((r) => r.fund === S.currentFund);
-  if (f.status) rows = rows.filter((r) => r.status === f.status);
-  if (q) rows = rows.filter((r) => [r.ar_no, r.recipient_name, r.recipient_barangay, r.purpose].some((v) => (v || "").toLowerCase().includes(q)));
-  rows.sort((a, b) => (b.ar_no || "").localeCompare(a.ar_no || ""));
+  let rows = [...S.air.values()].filter((r) => r.fund === S.currentFund);
+  if (f.status) rows = rows.filter((r) => (r.status || "for_accounting") === f.status);
+  if (q) rows = rows.filter((r) => [r.air_no, r.supplier, r.dept_office, r.po_no, r.inv_no, r.requisitioning_office].some((v) => (v || "").toLowerCase().includes(q)));
+  rows.sort((a, b) => (b.air_no || "").localeCompare(a.air_no || ""));
   return rows;
 }
 
-function renderAr() {
-  const saved = captureFocus("view-ar");
-  const f = S.arFilter;
-  const rows = filterArRows(f);
-  const canE = canEdit("ar");
-  document.getElementById("view-ar").innerHTML = `
-    <div class="panel small">Acknowledgement Receipt is used whenever inventory is given out to a barangay, beneficiary, or the public (Distributed Inventory). For inventory issued to an office for its own internal use, use RIS (Consumed Inventory) instead.</div>
+function airTotal(r) {
+  return (r.lines || []).reduce((s, l) => s + (Number(l.qty) || 0) * (Number(l.unit_cost) || 0), 0);
+}
+
+function renderAir() {
+  const saved = captureFocus("view-air");
+  const f = S.airFilter;
+  const rows = filterAirRows(f);
+  const canE = canEdit("air");
+  document.getElementById("view-air").innerHTML = `
+    <div class="panel small">Deliveries are parked here after they are received and inspected. They only become stock in the <b>Inventory Registry</b> once Accounting opens the AIR and clicks <b>Received in Accounting</b>.</div>
     <div class="toolbar">
-      <input class="grow" id="arSearch" placeholder="Search AR no., recipient, barangay, purpose..." value="${esc(f.q)}"/>
-      <select id="arStatusFilter">
+      <input class="grow" id="airSearch" placeholder="Search AIR no., supplier, PO no., office..." value="${esc(f.q)}"/>
+      <select id="airStatusFilter">
         <option value="" ${!f.status ? "selected" : ""}>All statuses</option>
-        <option value="draft" ${f.status === "draft" ? "selected" : ""}>Draft</option>
-        <option value="issued" ${f.status === "issued" ? "selected" : ""}>Issued</option>
+        <option value="for_accounting" ${f.status === "for_accounting" ? "selected" : ""}>For Accounting</option>
+        <option value="posted" ${f.status === "posted" ? "selected" : ""}>In Registry</option>
       </select>
       <div class="toolbar-right">
-        <button class="btn" onclick="exportArCsv()">Download CSV</button>
-        ${canE ? `<button class="btn primary" onclick="openArModal()">+ New Acknowledgement Receipt</button>` : ""}
+        <button class="btn" onclick="exportAirCsv()">Download CSV</button>
+        ${canE ? `<button class="btn primary" onclick="openAirModal()">+ New AIR</button>` : ""}
       </div>
     </div>
     <div class="table-wrap"><table>
-      <thead><tr><th>AR No.</th><th>Date</th><th>Recipient</th><th>Purpose</th><th>Status</th></tr></thead>
+      <thead><tr><th>AIR No.</th><th>Date</th><th>Supplier</th><th>Dept/Office</th><th class="num">Items</th><th class="num">Value</th><th>Status</th></tr></thead>
       <tbody>${rows.length ? rows.map((r) => `
-        <tr class="clickable" onclick="openArDetail('${r.id}')">
-          <td>${esc(r.ar_no)}</td><td>${fmtDate(r.date)}</td><td>${esc(r.recipient_name || "")}${r.recipient_barangay ? " / " + esc(r.recipient_barangay) : ""}</td>
-          <td>${esc(r.purpose || "")}</td>
-          <td><span class="pill ${r.status === "issued" ? "ok" : "muted"}">${r.status === "issued" ? "Issued" : "Draft"}</span></td>
-        </tr>`).join("") : `<tr><td colspan="5"><div class="empty">No Acknowledgement Receipts match this filter.</div></td></tr>`}</tbody>
+        <tr class="clickable" onclick="openAirDetail('${r.id}')">
+          <td>${esc(r.air_no)}</td><td>${fmtDate(r.date)}</td><td>${esc(r.supplier || "")}</td><td>${esc(r.dept_office || "")}</td>
+          <td class="num">${(r.lines || []).length}</td>
+          <td class="num">${fmtMoney(airTotal(r))}</td>
+          <td><span class="pill ${r.status === "posted" ? "ok" : "muted"}">${r.status === "posted" ? "In Registry" : "For Accounting"}</span></td>
+        </tr>`).join("") : `<tr><td colspan="7"><div class="empty">No Acceptance and Inspection Reports match this filter.</div></td></tr>`}</tbody>
     </table></div>`;
-  document.getElementById("arSearch").addEventListener("input", (e) => { S.arFilter.q = e.target.value; renderAr(); });
-  document.getElementById("arStatusFilter").addEventListener("change", (e) => { S.arFilter.status = e.target.value; renderAr(); });
+  document.getElementById("airSearch").addEventListener("input", (e) => { S.airFilter.q = e.target.value; renderAir(); });
+  document.getElementById("airStatusFilter").addEventListener("change", (e) => { S.airFilter.status = e.target.value; renderAir(); });
   restoreFocus(saved);
 }
 
-function arLineRowHtml(l, idx) {
-  const item = l.item_id ? S.items.get(l.item_id) : null;
+function airLineRowHtml(l, idx) {
+  const known = itemByStockNo(S.currentFund, l.stock_no);
   return `<tr data-idx="${idx}">
-    <td><select class="ar_line_item" data-idx="${idx}">
-      <option value="">-- pick item --</option>
-      ${activeItems(S.currentFund).map((a) => `<option value="${a.id}" ${a.id === l.item_id ? "selected" : ""}>${esc(a.stock_no)} - ${esc(a.description)}</option>`).join("")}
-    </select></td>
-    <td>${esc(item ? item.unit : l.unit || "")}</td>
-    <td><input class="ar_line_qtyreq" data-idx="${idx}" type="number" step="0.01" value="${l.qty_requested || 0}"/></td>
-    <td><input class="ar_line_qtyiss" data-idx="${idx}" type="number" step="0.01" value="${l.qty_issued != null ? l.qty_issued : ""}"/></td>
-    <td><input class="ar_line_remarks" data-idx="${idx}" value="${esc(l.remarks || "")}"/></td>
-    <td><button class="btn ghost" onclick="removeArLine(${idx})">✕</button></td>
+    <td><input class="air_line_stockno" data-idx="${idx}" value="${esc(l.stock_no || "")}" placeholder="Stock/Property No."/>
+      <div class="small air_line_hint" data-idx="${idx}">${known ? "in registry: " + esc(known.description) : ""}</div></td>
+    <td><input class="air_line_desc" data-idx="${idx}" value="${esc(l.description || "")}"/></td>
+    <td><input class="air_line_unit" data-idx="${idx}" value="${esc(l.unit || "")}" style="width:70px;"/></td>
+    <td><input class="air_line_qty" data-idx="${idx}" type="number" step="0.01" value="${l.qty || 0}"/></td>
+    <td><input class="air_line_unitcost" data-idx="${idx}" type="number" step="0.01" value="${l.unit_cost || 0}"/></td>
+    <td><select class="air_line_account" data-idx="${idx}">${accountOptionsHtml(l.account_code || (known && known.account_code))}</select></td>
+    <td><button class="btn ghost" onclick="removeAirLine(${idx})">✕</button></td>
   </tr>`;
 }
 
-let _arDraftLines = [];
-function addArLine() { _arDraftLines.push({}); renderArLinesTable(); }
-function removeArLine(idx) { _arDraftLines.splice(idx, 1); renderArLinesTable(); }
-function renderArLinesTable() {
-  const body = document.getElementById("arLinesBody");
+let _airDraftLines = [];
+function addAirLine() { _airDraftLines.push({}); renderAirLinesTable(); }
+function removeAirLine(idx) { _airDraftLines.splice(idx, 1); renderAirLinesTable(); }
+function renderAirLinesTable() {
+  const body = document.getElementById("airLinesBody");
   if (!body) return;
-  body.innerHTML = _arDraftLines.map((l, i) => arLineRowHtml(l, i)).join("");
+  body.innerHTML = _airDraftLines.map((l, i) => airLineRowHtml(l, i)).join("");
 }
 
-function openArModal(id) {
-  if (!canEdit("ar")) { toast("You have view-only access to Acknowledgement Receipt.", true); return; }
-  const r = id ? S.ar.get(id) : null;
-  _arDraftLines = r ? (r.lines || []).map((l) => ({ ...l })) : [{}];
-  const suggested = r ? r.ar_no : nextDocNumber(S.ar, S.currentFund, todayStr(), "ar_no");
+function openAirModal(id) {
+  if (!canEdit("air")) { toast("You have view-only access to AIR.", true); return; }
+  const r = id ? S.air.get(id) : null;
+  if (r && r.status === "posted") { toast("This AIR is already in the registry - unpost it first to edit.", true); return; }
+  _airDraftLines = r ? (r.lines || []).map((l) => ({ ...l })) : [{}];
+  const suggested = r ? r.air_no : nextDocNumber(S.air, S.currentFund, todayStr(), "air_no");
   openModal(`
-    <div class="modal-head"><h3>${r ? "Edit Acknowledgement Receipt" : "New Acknowledgement Receipt"}</h3><button class="btn ghost" onclick="closeModal()">✕</button></div>
+    <div class="modal-head"><h3>${r ? "Edit AIR" : "New Acceptance and Inspection Report"}</h3><button class="btn ghost" onclick="closeModal()">✕</button></div>
     <div class="modal-body">
-      <div class="grid2">
-        <div><label>AR No.</label><input id="ar_no" value="${esc(suggested)}"/></div>
-        <div><label>Date</label><input id="ar_date" type="date" value="${r ? r.date : todayStr()}"/></div>
+      <div class="grid3">
+        <div><label>AIR No.</label><input id="air_no" value="${esc(suggested)}"/></div>
+        <div><label>Date</label><input id="air_date" type="date" value="${r ? r.date : todayStr()}"/></div>
+        <div><label>Dept/Office</label><input id="air_dept" value="${esc(r ? r.dept_office || "" : "")}"/></div>
       </div>
-      <div class="grid2">
-        <div><label>Recipient (name / office)</label><input id="ar_recipient" value="${esc(r ? r.recipient_name : "")}"/></div>
-        <div><label>Barangay / Address</label><input id="ar_barangay" value="${esc(r ? r.recipient_barangay || "" : "")}"/></div>
+      <div class="grid3">
+        <div><label>Supplier</label><input id="air_supplier" value="${esc(r ? r.supplier || "" : "")}"/></div>
+        <div><label>PO No.</label><input id="air_pono" value="${esc(r ? r.po_no || "" : "")}"/></div>
+        <div><label>PO Date</label><input id="air_podate" type="date" value="${r ? r.po_date || "" : ""}"/></div>
+      </div>
+      <div class="grid3">
+        <div><label>Requisitioning Office/Dept.</label><input id="air_reqoffice" value="${esc(r ? r.requisitioning_office || "" : "")}"/></div>
+        <div><label>Invoice No.</label><input id="air_invno" value="${esc(r ? r.inv_no || "" : "")}"/></div>
+        <div><label>Invoice Date</label><input id="air_invdate" type="date" value="${r ? r.inv_date || "" : ""}"/></div>
       </div>
       <div class="hr"></div>
-      <table class="line-table"><thead><tr><th>Item</th><th>Unit</th><th>Qty Requested</th><th>Qty Issued</th><th>Remarks</th><th></th></tr></thead>
-        <tbody id="arLinesBody"></tbody>
+      <table class="line-table"><thead><tr><th>Stock/Property No.</th><th>Description</th><th>Unit</th><th>Quantity</th><th>Unit Cost</th><th>Inventory account</th><th></th></tr></thead>
+        <tbody id="airLinesBody"></tbody>
       </table>
-      <button class="btn" style="margin-top:8px;" onclick="addArLine()">+ Add line</button>
+      <button class="btn" style="margin-top:8px;" onclick="addAirLine()">+ Add line</button>
+      <p class="small">Unit Cost and the inventory account are not on the printed AIR form - they're captured here because the registry needs them to value the stock once Accounting posts it.</p>
       <div class="hr"></div>
-      <label>Purpose</label><textarea id="ar_purpose">${esc(r ? r.purpose || "" : "")}</textarea>
       <div class="grid2">
-        <div><label>Released by (name)</label><input id="ar_rel_name" value="${esc(r ? r.released_by_name || "" : "")}"/></div>
-        <div><label>Released by (position)</label><input id="ar_rel_pos" value="${esc(r ? r.released_by_position || "PROPERTY CUSTODIAN" : "PROPERTY CUSTODIAN")}"/></div>
-      </div>
-      <div class="grid2">
-        <div><label>Received by (name)</label><input id="ar_rec_name" value="${esc(r ? r.received_by_name || "" : "")}"/></div>
-        <div><label>Received by (position)</label><input id="ar_rec_pos" value="${esc(r ? r.received_by_position || "" : "")}"/></div>
-      </div>
-      <div class="grid2">
-        <div><label>Witnessed by (name)</label><input id="ar_wit_name" value="${esc(r ? r.witnessed_by_name || "" : "")}"/></div>
-        <div><label>Witnessed by (position)</label><input id="ar_wit_pos" value="${esc(r ? r.witnessed_by_position || "" : "")}"/></div>
+        <div>
+          <label>Acceptance - Date Received</label><input id="air_daterec" type="date" value="${r ? r.date_received || todayStr() : todayStr()}"/>
+          <label>Acceptance</label>
+          <select id="air_acceptance">
+            <option value="complete" ${!r || r.acceptance !== "partial" ? "selected" : ""}>Complete</option>
+            <option value="partial" ${r && r.acceptance === "partial" ? "selected" : ""}>Partial (pls. specify)</option>
+          </select>
+          <label>If partial, specify</label><input id="air_partial" value="${esc(r ? r.partial_note || "" : "")}"/>
+          <label>Supply and/or Property Custodian</label><input id="air_custodian" value="${esc(r ? r.custodian_name || "" : "")}"/>
+        </div>
+        <div>
+          <label>Inspection - Date Inspected</label><input id="air_dateinsp" type="date" value="${r ? r.date_inspected || todayStr() : todayStr()}"/>
+          <label style="display:flex;align-items:center;gap:8px;margin-top:12px;"><input type="checkbox" id="air_inspected" style="width:auto;" ${!r || r.inspected_ok !== false ? "checked" : ""}/> Inspected, verified and found in order as to quantity and specifications</label>
+          <label>Inspection Officer/Inspection Committee</label><input id="air_inspector" value="${esc(r ? r.inspector_name || "" : "")}"/>
+        </div>
       </div>
     </div>
     <div class="modal-foot">
       <button class="btn ghost" onclick="closeModal()">Cancel</button>
-      <button class="btn primary" onclick="saveAr('${r ? r.id : ""}')">Save as draft</button>
+      <button class="btn primary" onclick="saveAir('${r ? r.id : ""}')">Save AIR</button>
     </div>`, "wide");
-  renderArLinesTable();
-  document.getElementById("arLinesBody").addEventListener("change", (e) => {
+  renderAirLinesTable();
+  const body = document.getElementById("airLinesBody");
+  const onEdit = (e) => {
     const idx = Number(e.target.dataset.idx);
     if (idx == null || isNaN(idx)) return;
-    const l = _arDraftLines[idx] || (_arDraftLines[idx] = {});
-    if (e.target.classList.contains("ar_line_item")) {
-      l.item_id = e.target.value;
-      const item = S.items.get(l.item_id);
-      if (item) { l.stock_no = item.stock_no; l.description = item.description; l.unit = item.unit; }
-    } else if (e.target.classList.contains("ar_line_qtyreq")) l.qty_requested = Number(e.target.value) || 0;
-    else if (e.target.classList.contains("ar_line_qtyiss")) l.qty_issued = e.target.value === "" ? null : Number(e.target.value);
-    else if (e.target.classList.contains("ar_line_remarks")) l.remarks = e.target.value;
-  });
+    const l = _airDraftLines[idx] || (_airDraftLines[idx] = {});
+    if (e.target.classList.contains("air_line_stockno")) {
+      l.stock_no = e.target.value.trim();
+      const known = itemByStockNo(S.currentFund, l.stock_no);
+      const hint = body.querySelector(`.air_line_hint[data-idx="${idx}"]`);
+      if (hint) hint.textContent = known ? `in registry: ${known.description}` : "";
+      if (known) {
+        // Same stock number as something already in the registry: pre-fill the rest of the row
+        // from that item, so this delivery files itself inside it. Patched in place on purpose -
+        // re-rendering the table here would yank away whatever field is being typed into next.
+        const fill = (cls, val) => {
+          const el = body.querySelector(`.${cls}[data-idx="${idx}"]`);
+          if (el && !el.value) el.value = val || "";
+        };
+        if (!l.description) { l.description = known.description; fill("air_line_desc", known.description); }
+        if (!l.unit) { l.unit = known.unit; fill("air_line_unit", known.unit); }
+        if (!l.account_code) {
+          l.account_code = known.account_code;
+          const sel = body.querySelector(`.air_line_account[data-idx="${idx}"]`);
+          if (sel) sel.value = known.account_code;
+        }
+      }
+    } else if (e.target.classList.contains("air_line_desc")) l.description = e.target.value;
+    else if (e.target.classList.contains("air_line_unit")) l.unit = e.target.value;
+    else if (e.target.classList.contains("air_line_qty")) l.qty = Number(e.target.value) || 0;
+    else if (e.target.classList.contains("air_line_unitcost")) l.unit_cost = Number(e.target.value) || 0;
+    else if (e.target.classList.contains("air_line_account")) l.account_code = e.target.value;
+  };
+  // "input" keeps the draft in step with every keystroke; "change" catches the select.
+  body.addEventListener("input", onEdit);
+  body.addEventListener("change", onEdit);
 }
 
-function collectArLines() {
-  return _arDraftLines.filter((l) => l.item_id).map((l) => ({
-    id: l.id || uid(), item_id: l.item_id, stock_no: l.stock_no, description: l.description, unit: l.unit,
-    qty_requested: Number(l.qty_requested) || 0,
-    qty_issued: l.qty_issued == null ? null : Number(l.qty_issued),
-    remarks: l.remarks || "",
+function collectAirLines() {
+  return _airDraftLines.filter((l) => (l.stock_no || "").trim()).map((l) => ({
+    id: l.id || uid(),
+    stock_no: (l.stock_no || "").trim(),
+    description: (l.description || "").trim(),
+    unit: (l.unit || "").trim(),
+    qty: Number(l.qty) || 0,
+    unit_cost: Number(l.unit_cost) || 0,
+    account_code: l.account_code || ACCOUNT_CATALOG[0].code,
   }));
 }
 
-function saveAr(id) {
-  if (blockIfViewOnly("ar")) return;
-  const ar_no = document.getElementById("ar_no").value.trim();
+function saveAir(id) {
+  if (blockIfViewOnly("air")) return;
+  const air_no = document.getElementById("air_no").value.trim();
   const fund = S.currentFund;
-  if (numberTaken(S.ar, fund, "ar_no", ar_no, id)) { toast(`AR No. ${ar_no} is already used in this fund.`, true); return; }
-  const recipient_name = document.getElementById("ar_recipient").value.trim();
-  if (!recipient_name) { toast("Recipient is required.", true); return; }
+  if (numberTaken(S.air, fund, "air_no", air_no, id)) { toast(`AIR No. ${air_no} is already used in this fund.`, true); return; }
+  const lines = collectAirLines();
+  if (!lines.length) { toast("Add at least one item line (a Stock/Property No. is required).", true); return; }
   const rec = {
-    fund, ar_no, date: document.getElementById("ar_date").value || todayStr(),
-    recipient_name, recipient_barangay: document.getElementById("ar_barangay").value.trim(),
-    lines: collectArLines(),
-    purpose: document.getElementById("ar_purpose").value.trim(),
-    released_by_name: document.getElementById("ar_rel_name").value.trim(),
-    released_by_position: document.getElementById("ar_rel_pos").value.trim(),
-    received_by_name: document.getElementById("ar_rec_name").value.trim(),
-    received_by_position: document.getElementById("ar_rec_pos").value.trim(),
-    witnessed_by_name: document.getElementById("ar_wit_name").value.trim(),
-    witnessed_by_position: document.getElementById("ar_wit_pos").value.trim(),
-    status: "draft",
+    fund, air_no, date: document.getElementById("air_date").value || todayStr(),
+    dept_office: document.getElementById("air_dept").value.trim(),
+    supplier: document.getElementById("air_supplier").value.trim(),
+    po_no: document.getElementById("air_pono").value.trim(),
+    po_date: document.getElementById("air_podate").value || "",
+    requisitioning_office: document.getElementById("air_reqoffice").value.trim(),
+    inv_no: document.getElementById("air_invno").value.trim(),
+    inv_date: document.getElementById("air_invdate").value || "",
+    lines,
+    date_received: document.getElementById("air_daterec").value || "",
+    acceptance: document.getElementById("air_acceptance").value,
+    partial_note: document.getElementById("air_partial").value.trim(),
+    custodian_name: document.getElementById("air_custodian").value.trim(),
+    date_inspected: document.getElementById("air_dateinsp").value || "",
+    inspected_ok: document.getElementById("air_inspected").checked,
+    inspector_name: document.getElementById("air_inspector").value.trim(),
+    status: "for_accounting",
     updated_at: Date.now(),
   };
-  if (!rec.lines.length) { toast("Add at least one item line.", true); return; }
   if (id) {
-    colAr.doc(id).update(rec).then(() => { toast("Acknowledgement Receipt saved."); closeModal(); }).catch((e) => toast(e.message, true));
+    colAir.doc(id).update(rec).then(() => { toast("AIR saved."); closeModal(); }).catch((e) => toast(e.message, true));
   } else {
     rec.created_at = Date.now();
-    colAr.doc().set(rec).then(() => { toast("Acknowledgement Receipt saved as draft."); closeModal(); }).catch((e) => toast(e.message, true));
+    colAir.doc().set(rec).then(() => { toast("AIR saved - waiting for Accounting."); closeModal(); }).catch((e) => toast(e.message, true));
   }
 }
 
-function openArDetail(id) {
-  const r = S.ar.get(id);
+function openAirDetail(id) {
+  const r = S.air.get(id);
   if (!r) return;
-  const canE = canEdit("ar");
-  const rows = (r.lines || []).map((l) => `<tr>
-      <td>${esc(l.stock_no)}</td><td>${esc(l.description)}</td>
-      <td class="num">${fmtNum(l.qty_requested)}</td>
-      <td class="num">${l.qty_issued != null ? fmtNum(l.qty_issued) : "—"}</td>
-    </tr>`).join("");
+  const canE = canEdit("air");
+  const posted = r.status === "posted";
+  const rows = (r.lines || []).map((l) => {
+    const known = itemByStockNo(r.fund, l.stock_no);
+    return `<tr>
+      <td>${esc(l.stock_no)}${known ? ` <span class="pill muted">${posted ? "in registry" : "existing item"}</span>` : (posted ? "" : ' <span class="pill check">new item</span>')}</td>
+      <td>${esc(l.description)}</td><td>${esc(l.unit)}</td>
+      <td class="num">${fmtNum(l.qty)}</td>
+      <td class="num">${fmtNum(l.unit_cost)}</td>
+      <td class="num">${fmtMoney((Number(l.qty) || 0) * (Number(l.unit_cost) || 0))}</td>
+    </tr>`;
+  }).join("");
   openModal(`
-    <div class="modal-head"><h3>Acknowledgement Receipt ${esc(r.ar_no)}</h3><button class="btn ghost" onclick="closeModal()">✕</button></div>
+    <div class="modal-head"><h3>AIR ${esc(r.air_no)}</h3><button class="btn ghost" onclick="closeModal()">✕</button></div>
     <div class="modal-body">
       <div class="grid3 small">
         <div><b>Date</b><br/>${fmtDate(r.date)}</div>
-        <div><b>Recipient</b><br/>${esc(r.recipient_name)}${r.recipient_barangay ? " / " + esc(r.recipient_barangay) : ""}</div>
-        <div><b>Status</b><br/><span class="pill ${r.status === "issued" ? "ok" : "muted"}">${r.status === "issued" ? "Issued" : "Draft"}</span></div>
+        <div><b>Supplier</b><br/>${esc(r.supplier || "")}</div>
+        <div><b>Status</b><br/><span class="pill ${posted ? "ok" : "muted"}">${posted ? "Received in Accounting - in Registry" : "For Accounting"}</span></div>
+      </div>
+      <div class="grid3 small" style="margin-top:8px;">
+        <div><b>Dept/Office</b><br/>${esc(r.dept_office || "")}</div>
+        <div><b>PO No./Date</b><br/>${esc(r.po_no || "")}${r.po_date ? " / " + fmtDate(r.po_date) : ""}</div>
+        <div><b>Invoice No./Date</b><br/>${esc(r.inv_no || "")}${r.inv_date ? " / " + fmtDate(r.inv_date) : ""}</div>
       </div>
       <div class="hr"></div>
-      <div class="table-wrap"><table><thead><tr><th>Stock No.</th><th>Description</th><th class="num">Qty Req.</th><th class="num">Qty Issued</th></tr></thead><tbody>${rows}</tbody></table></div>
-      <p class="small" style="margin-top:10px;"><b>Purpose:</b> ${esc(r.purpose || "")}</p>
+      <div class="table-wrap"><table><thead><tr><th>Stock/Property No.</th><th>Description</th><th>Unit</th><th class="num">Qty</th><th class="num">Unit Cost</th><th class="num">Amount</th></tr></thead>
+      <tbody>${rows}</tbody>
+      <tfoot><tr><td colspan="5" class="num"><b>Total</b></td><td class="num"><b>${fmtMoney(airTotal(r))}</b></td></tr></tfoot></table></div>
+      <div class="grid2 small" style="margin-top:10px;">
+        <div><b>Acceptance</b><br/>${r.acceptance === "partial" ? "Partial" : "Complete"}${r.partial_note ? " - " + esc(r.partial_note) : ""}<br/>Received ${r.date_received ? fmtDate(r.date_received) : "—"} &middot; ${esc(r.custodian_name || "")}</div>
+        <div><b>Inspection</b><br/>${r.inspected_ok ? "Inspected, verified and found in order" : "Not yet inspected"}<br/>Inspected ${r.date_inspected ? fmtDate(r.date_inspected) : "—"} &middot; ${esc(r.inspector_name || "")}</div>
+      </div>
+      ${posted ? `<p class="small" style="margin-top:10px;">Posted to the registry ${r.posted_at ? "on " + fmtDate(new Date(r.posted_at).toISOString().slice(0, 10)) : ""} by ${esc(r.posted_by || "")}.</p>` : ""}
     </div>
     <div class="modal-foot">
-      <button class="btn" onclick="printAr('${r.id}')">Print AR</button>
-      ${canE && r.status !== "issued" ? `<button class="btn" onclick="closeModal();openArModal('${r.id}')">Edit</button><button class="btn primary" onclick="openIssueArModal('${r.id}')">Issue</button><button class="btn danger" onclick="deleteAr('${r.id}')">Delete</button>` : ""}
-      ${canE && r.status === "issued" ? `<button class="btn danger" onclick="reverseAr('${r.id}')">↩ Reverse issuance</button>` : ""}
+      <button class="btn" onclick="printAir('${r.id}')">Print AIR</button>
+      ${canE && !posted ? `<button class="btn" onclick="closeModal();openAirModal('${r.id}')">Edit</button><button class="btn primary" onclick="openPostAirModal('${r.id}')">Received in Accounting</button><button class="btn danger" onclick="deleteAir('${r.id}')">Delete</button>` : ""}
+      ${canE && posted ? `<button class="btn danger" onclick="unpostAir('${r.id}')">↩ Unpost from registry</button>` : ""}
     </div>`, "wide");
 }
 
-function deleteAr(id) {
-  if (blockIfViewOnly("ar")) return;
-  const r = S.ar.get(id);
-  if (r && r.status === "issued") { toast("An issued Acknowledgement Receipt can only be undone via Reverse issuance.", true); return; }
-  if (!confirm("Delete this draft Acknowledgement Receipt?")) return;
-  colAr.doc(id).delete().then(() => { toast("Acknowledgement Receipt deleted."); closeModal(); }).catch((e) => toast(e.message, true));
+function deleteAir(id) {
+  if (blockIfViewOnly("air")) return;
+  const r = S.air.get(id);
+  if (r && r.status === "posted") { toast("This AIR is in the registry - unpost it first.", true); return; }
+  if (!confirm("Delete this AIR?")) return;
+  colAir.doc(id).delete().then(() => { toast("AIR deleted."); closeModal(); }).catch((e) => toast(e.message, true));
 }
 
-function openIssueArModal(id) {
-  if (blockIfViewOnly("ar")) return;
-  const r = S.ar.get(id);
+function openPostAirModal(id) {
+  if (blockIfViewOnly("air")) return;
+  const r = S.air.get(id);
+  const rows = (r.lines || []).map((l) => {
+    const known = itemByStockNo(r.fund, l.stock_no);
+    return `<tr>
+      <td>${esc(l.stock_no)} - ${esc(l.description)}</td>
+      <td class="num">${fmtNum(l.qty)} ${esc(l.unit)}</td>
+      <td>${known ? `<span class="pill ok">filed inside existing item</span><div class="small">${esc(known.description)} &middot; balance now ${fmtNum(qtyBalance(known))} ${esc(known.unit)}</div>`
+                  : `<span class="pill check">creates a new registry item</span>`}</td>
+    </tr>`;
+  }).join("");
   openModal(`
-    <div class="modal-head"><h3>Issue Acknowledgement Receipt ${esc(r.ar_no)}</h3><button class="btn ghost" onclick="closeModal()">✕</button></div>
+    <div class="modal-head"><h3>Received in Accounting - AIR ${esc(r.air_no)}</h3><button class="btn ghost" onclick="closeModal()">✕</button></div>
     <div class="modal-body">
-      <p class="small">Confirm the quantity actually released for each line. This deducts stock immediately and records it as <b>Distributed</b> to ${esc(r.recipient_name)}${r.recipient_barangay ? " (" + esc(r.recipient_barangay) + ")" : ""} - it cannot be edited afterward (only reversed).</p>
-      <table class="line-table"><thead><tr><th>Item</th><th class="num">Qty Req.</th><th>Qty Issued</th></tr></thead>
-      <tbody>
-        ${(r.lines || []).map((l, i) => `<tr>
-            <td>${esc(l.stock_no)} - ${esc(l.description)}</td>
-            <td class="num">${fmtNum(l.qty_requested)}</td>
-            <td><input class="ariss_qty" data-idx="${i}" type="number" step="0.01" value="${l.qty_issued != null ? l.qty_issued : l.qty_requested}"/></td>
-          </tr>`).join("")}
-      </tbody></table>
+      <p class="small">This moves the delivery into the <b>Inventory Registry</b>. Each line goes <i>inside</i> the item with the same Stock/Property No. if one already exists in ${esc(fundLabel(r.fund))}; otherwise a new item is created. It can be undone with Unpost.</p>
+      <div class="table-wrap"><table><thead><tr><th>Item</th><th class="num">Qty</th><th>Where it lands</th></tr></thead><tbody>${rows}</tbody></table></div>
+      <label>Posted by (Accounting)</label><input id="air_postedby" value="${esc(S.currentUser.email)}"/>
     </div>
     <div class="modal-foot">
       <button class="btn ghost" onclick="closeModal()">Cancel</button>
-      <button class="btn primary" onclick="confirmIssueAr('${r.id}')">Confirm issuance</button>
+      <button class="btn primary" onclick="confirmPostAir('${r.id}')">Confirm - move to Inventory Registry</button>
     </div>`, "wide");
 }
 
-function confirmIssueAr(id) {
-  if (blockIfViewOnly("ar")) return;
-  const r = S.ar.get(id);
-  const lines = (r.lines || []).map((l, i) => {
-    const qtyEl = document.querySelector(`.ariss_qty[data-idx="${i}"]`);
-    return { ...l, qty_issued: Number(qtyEl.value) || 0 };
-  });
-  // Validate stock availability first.
-  for (const l of lines) {
-    const item = S.items.get(l.item_id);
-    if (!item) continue;
-    if (l.qty_issued > qtyBalance(item) + 1e-6) { toast(`Not enough stock for ${item.description} (balance ${fmtNum(qtyBalance(item))} ${item.unit}).`, true); return; }
-  }
-  const recipient = r.recipient_name + (r.recipient_barangay ? ` (${r.recipient_barangay})` : "");
+function confirmPostAir(id) {
+  if (blockIfViewOnly("air")) return;
+  const r = S.air.get(id);
+  if (!r || r.status === "posted") return;
+  const postedBy = (document.getElementById("air_postedby") || {}).value || S.currentUser.email;
   const writes = [];
-  for (const l of lines) {
-    if (l.qty_issued <= 0) continue;
-    const item = S.items.get(l.item_id);
-    if (!item) continue;
-    const uc = unitCostBalance(item);
-    const entry = {
-      id: uid(), type: "issue", date: r.date, ref: r.ar_no,
-      qty: l.qty_issued, unit_cost: uc, total_cost: round2(l.qty_issued * uc),
-      disposition: "distributed", recipient, ar_id: r.id,
-      by: S.currentUser.email, at: Date.now(),
-    };
-    const ledger = (item.ledger || []).concat([entry]);
-    writes.push(colItems.doc(item.id).update({ ledger }));
-  }
-  Promise.all(writes)
-    .then(() => colAr.doc(id).update({ lines, status: "issued", issued_at: Date.now(), issued_by_email: S.currentUser.email }))
-    .then(() => { toast("Acknowledgement Receipt issued - stock updated (Distributed Inventory)."); closeModal(); })
-    .catch((e) => toast(e.message, true));
-}
-
-function reverseAr(id) {
-  if (blockIfViewOnly("ar")) return;
-  const r = S.ar.get(id);
-  if (!confirm(`Reverse issuance of Acknowledgement Receipt ${r.ar_no}? This restores the issued stock back onto each item and returns the AR to Draft.`)) return;
-  const writes = [];
+  const newDocs = [];
+  // Group this AIR's lines by stock number first, so two lines of the same stock number in one
+  // AIR still end up inside a single registry item.
+  const pending = new Map();
   for (const l of r.lines || []) {
-    const item = S.items.get(l.item_id);
-    if (!item || !l.qty_issued) continue;
-    const ledger = (item.ledger || []).filter((e) => !(e.ar_id === r.id));
-    writes.push(colItems.doc(item.id).update({ ledger }));
+    const qty = Number(l.qty) || 0;
+    if (qty <= 0) continue;
+    const key = String(l.stock_no).trim().toLowerCase();
+    const entry = {
+      id: uid(), type: "receipt", date: r.date_received || r.date,
+      ref: r.air_no, qty, unit_cost: Number(l.unit_cost) || 0, total_cost: round2(qty * (Number(l.unit_cost) || 0)),
+      air_id: r.id, supplier: r.supplier || "", by: S.currentUser.email, at: Date.now(),
+    };
+    const cur = pending.get(key) || { line: l, entries: [] };
+    cur.entries.push(entry);
+    pending.set(key, cur);
   }
+  if (!pending.size) { toast("Nothing to post - every line has zero quantity.", true); return; }
+  for (const { line, entries } of pending.values()) {
+    const existing = itemByStockNo(r.fund, line.stock_no);
+    if (existing) {
+      const ledger = (existing.ledger || []).concat(entries);
+      const last = entries[entries.length - 1];
+      writes.push(colItems.doc(existing.id).update({ ledger, unit_cost: last.unit_cost, status: "active", updated_at: Date.now() }));
+    } else {
+      const info = accountInfo(line.account_code);
+      const last = entries[entries.length - 1];
+      newDocs.push({
+        fund: r.fund,
+        account_code: line.account_code || ACCOUNT_CATALOG[0].code,
+        account_name: info ? info.name : "",
+        stock_no: line.stock_no,
+        description: line.description,
+        item: line.description,
+        unit: line.unit,
+        reorder_point: 0,
+        unit_cost: last.unit_cost,
+        expense_account_code: info && info.expense ? info.expense.code : "",
+        expense_account_name: info && info.expense ? info.expense.name : "",
+        status: "active",
+        ledger: entries,
+        created_at: Date.now(), updated_at: Date.now(),
+      });
+    }
+  }
+  for (const doc of newDocs) writes.push(colItems.doc().set(doc));
   Promise.all(writes)
-    .then(() => colAr.doc(id).update({ status: "draft", issued_at: null, reversed_at: Date.now(), reversed_by: S.currentUser.email }))
-    .then(() => { toast("Issuance reversed."); closeModal(); })
+    .then(() => colAir.doc(id).update({ status: "posted", posted_at: Date.now(), posted_by: postedBy }))
+    .then(() => { toast("AIR received in Accounting - stock is now in the Inventory Registry."); closeModal(); })
     .catch((e) => toast(e.message, true));
 }
 
-function printAr(id) { openPrintWindow(arHtml(S.ar.get(id)), "portrait"); }
+function unpostAir(id) {
+  if (blockIfViewOnly("air")) return;
+  const r = S.air.get(id);
+  if (!confirm(`Unpost AIR ${r.air_no} from the Inventory Registry? This removes exactly this AIR's receipts from every affected item and returns it to "For Accounting".`)) return;
+  const writes = [];
+  for (const a of S.items.values()) {
+    if (a.fund !== r.fund) continue;
+    const ledger = (a.ledger || []).filter((e) => e.air_id !== r.id);
+    if (ledger.length !== (a.ledger || []).length) writes.push(colItems.doc(a.id).update({ ledger }));
+  }
+  Promise.all(writes)
+    .then(() => colAir.doc(id).update({ status: "for_accounting", posted_at: null, unposted_at: Date.now(), unposted_by: S.currentUser.email }))
+    .then(() => { toast("AIR unposted - the stock was removed from the registry."); closeModal(); })
+    .catch((e) => toast(e.message, true));
+}
 
-function exportArCsv() {
-  const rows = filterArRows(S.arFilter);
-  const header = ["AR No.", "Date", "Recipient", "Barangay/Address", "Purpose", "Status", "Stock No.", "Description", "Qty Requested", "Qty Issued"];
+function printAir(id) { openPrintWindow(airHtml(S.air.get(id)), "portrait"); }
+
+function exportAirCsv() {
+  const rows = filterAirRows(S.airFilter);
+  const header = ["AIR No.", "Date", "Supplier", "Dept/Office", "PO No.", "Invoice No.", "Status", "Stock/Property No.", "Description", "Unit", "Quantity", "Unit Cost", "Amount"];
   const lines = [header.join(",")];
   for (const r of rows) {
     for (const l of r.lines || []) {
-      lines.push([r.ar_no, r.date, r.recipient_name, r.recipient_barangay, r.purpose, r.status, l.stock_no, l.description, l.qty_requested, l.qty_issued].map(csvField).join(","));
+      lines.push([r.air_no, r.date, r.supplier, r.dept_office, r.po_no, r.inv_no, r.status === "posted" ? "In Registry" : "For Accounting",
+        l.stock_no, l.description, l.unit, l.qty, l.unit_cost, round2((Number(l.qty) || 0) * (Number(l.unit_cost) || 0))].map(csvField).join(","));
     }
   }
-  browserDownload(`AR_${S.currentFund}_${todayStr()}.csv`, lines.join("\n"), "text/csv");
+  browserDownload(`AIR_${S.currentFund}_${todayStr()}.csv`, lines.join("\n"), "text/csv");
 }
 
 // ---------------------------------------------------------------------
@@ -1511,6 +1815,11 @@ function openGenerateRsmiModal() {
         <div><label>Certified by (Supply/Property Custodian)</label><input id="rsmi_certby"/></div>
         <div><label>Posted by (Accounting staff)</label><input id="rsmi_postby"/></div>
       </div>
+      <label>Include</label>
+      <select id="rsmi_type">
+        <option value="">Consumption + Distribution (all issuances)</option>
+        ${ISSUE_TYPES.map((t) => `<option value="${t.code}">${esc(t.label)} only</option>`).join("")}
+      </select>
       <p class="small">Pulls every issued RIS line dated within this range, grouped by Stock No. for the recapitulation.</p>
     </div>
     <div class="modal-foot">
@@ -1525,17 +1834,25 @@ function generateRsmi() {
   const from = document.getElementById("rsmi_from").value;
   const to = document.getElementById("rsmi_to").value;
   if (!from || !to || from > to) { toast("Enter a valid period range.", true); return; }
+  const onlyType = document.getElementById("rsmi_type").value;
   const lines = [];
   for (const r of S.ris.values()) {
     if (r.fund !== fund || r.status !== "issued") continue;
     if (r.date < from || r.date > to) continue;
+    if (onlyType && (r.issue_type || "consumption") !== onlyType) continue;
     for (const l of r.lines || []) {
       if (!l.qty_issued) continue;
       const item = S.items.get(l.item_id);
+      // Prefer the cost actually captured on the ledger entry this RIS wrote, so a later
+      // delivery at a different price can't retroactively change what this report says.
+      const entry = item ? (item.ledger || []).find((e) => e.ris_id === r.id) : null;
+      const unit_cost = entry ? Number(entry.unit_cost) || 0 : (item ? unitCostBalance(item) : 0);
       lines.push({
         ris_no: r.ris_no, responsibility_center: r.fpp_code || "", stock_no: l.stock_no, item: l.description,
-        unit: l.unit, qty: l.qty_issued, unit_cost: item ? unitCostBalance(item) : 0,
-        amount: round2(l.qty_issued * (item ? unitCostBalance(item) : 0)), account_code: item ? item.account_code : "",
+        unit: l.unit, qty: l.qty_issued, unit_cost,
+        amount: entry ? Number(entry.total_cost) || 0 : round2(l.qty_issued * unit_cost),
+        account_code: item ? item.account_code : "",
+        issue_type: r.issue_type || "consumption",
       });
     }
   }
@@ -1547,7 +1864,7 @@ function generateRsmi() {
     byStock.set(k, cur);
   }
   const rec = {
-    fund, period_from: from, period_to: to, date: todayStr(),
+    fund, period_from: from, period_to: to, date: todayStr(), issue_type: onlyType || "",
     serial_no: nextDocNumber(S.rsmi, fund, todayStr(), "serial_no"),
     lines, recap: [...byStock.values()],
     certified_by_name: document.getElementById("rsmi_certby").value.trim(),
@@ -1563,8 +1880,10 @@ function openRsmiDetail(id) {
     <div class="modal-head"><h3>RSMI ${esc(r.serial_no)}</h3><button class="btn ghost" onclick="closeModal()">✕</button></div>
     <div class="modal-body">
       <p class="small">${fmtDate(r.period_from)} to ${fmtDate(r.period_to)} &middot; ${esc(fundLabel(r.fund))}</p>
-      <div class="table-wrap"><table><thead><tr><th>RIS No.</th><th>Stock No.</th><th>Item</th><th class="num">Qty</th><th class="num">Amount</th></tr></thead>
-      <tbody>${(r.lines || []).map((l) => `<tr><td>${esc(l.ris_no)}</td><td>${esc(l.stock_no)}</td><td>${esc(l.item)}</td><td class="num">${fmtNum(l.qty)}</td><td class="num">${fmtMoney(l.amount)}</td></tr>`).join("") || '<tr><td colspan="5"><div class="empty">No issuances in this period.</div></td></tr>'}</tbody>
+      <div class="table-wrap"><table><thead><tr><th>RIS No.</th><th>Type</th><th>Stock No.</th><th>Item</th><th class="num">Qty</th><th class="num">Amount</th></tr></thead>
+      <tbody>${(r.lines || []).map((l) => `<tr><td>${esc(l.ris_no)}</td>
+        <td><span class="pill ${l.issue_type === "distribution" ? "distributed" : "consumed"}">${esc(issueTypeLabel(l.issue_type))}</span></td>
+        <td>${esc(l.stock_no)}</td><td>${esc(l.item)}</td><td class="num">${fmtNum(l.qty)}</td><td class="num">${fmtMoney(l.amount)}</td></tr>`).join("") || '<tr><td colspan="6"><div class="empty">No issuances in this period.</div></td></tr>'}</tbody>
       </table></div>
     </div>
     <div class="modal-foot">
@@ -1581,75 +1900,90 @@ function deleteRsmi(id) {
 function printRsmi(id) { openPrintWindow(rsmiHtml(S.rsmi.get(id)), "portrait"); }
 function exportRsmiCsv(id) {
   const r = S.rsmi.get(id);
-  const header = ["RIS No.", "Stock No.", "Item", "Unit", "Qty", "Unit Cost", "Amount", "Account Code"];
-  const lines = [header.join(",")].concat((r.lines || []).map((l) => [l.ris_no, l.stock_no, l.item, l.unit, l.qty, l.unit_cost, l.amount, l.account_code].map(csvField).join(",")));
+  const header = ["RIS No.", "Type", "Stock No.", "Item", "Unit", "Qty", "Unit Cost", "Amount", "Account Code"];
+  const lines = [header.join(",")].concat((r.lines || []).map((l) => [l.ris_no, issueTypeLabel(l.issue_type), l.stock_no, l.item, l.unit, l.qty, l.unit_cost, l.amount, l.account_code].map(csvField).join(",")));
   browserDownload(`RSMI_${esc(r.serial_no)}.csv`, lines.join("\n"), "text/csv");
 }
 
 // ---------------------------------------------------------------------
-// Distributed Inventory (issuance report) - RSMI already serves as Consumed Inventory's own
-// report (a recap of every issued RIS line), so there is no separate "Report" item under the
-// Consumed Inventory group; this report exists only for Distributed Inventory / Acknowledgement
-// Receipts, which have no equivalent recap document.
+// Issued Inventory - the single, merged issuance report. Every issuance in the system comes from
+// a RIS, tagged Consumption or Distribution, so this one report covers both; filter by type to
+// see either side on its own.
 // ---------------------------------------------------------------------
 
-function distributedRowsFor(f) {
+function issuedRowsFor(f) {
   const fund = S.currentFund;
+  const wanted = f.type ? issueTypeInfo(f.type).disposition : null;
   const rows = [];
   for (const a of S.items.values()) {
     if (a.fund !== fund) continue;
     for (const e of a.ledger || []) {
       if (e.type !== "issue") continue;
-      if ((e.disposition || (isDistributionAccount(a.account_code) ? "distributed" : "consumed")) !== "distributed") continue;
+      const disp = e.disposition === "distributed" ? "distributed" : "consumed";
+      if (wanted && disp !== wanted) continue;
       if (f.from && e.date < f.from) continue;
       if (f.to && e.date > f.to) continue;
       if (f.q) {
         const q = f.q.toLowerCase();
-        if (![a.stock_no, a.description, e.recipient, e.ref].some((v) => (v || "").toLowerCase().includes(q))) continue;
+        if (![a.stock_no, a.description, e.office, e.recipient, e.ref].some((v) => (v || "").toLowerCase().includes(q))) continue;
       }
-      rows.push({ item: a, entry: e });
+      rows.push({ item: a, entry: e, disp });
     }
   }
   rows.sort((x, y) => (y.entry.date || "").localeCompare(x.entry.date || ""));
   return rows;
 }
 
-function renderDistributed() {
-  const f = S.distributedFilter;
-  const rows = distributedRowsFor(f);
+function renderIssued() {
+  const saved = captureFocus("view-issued");
+  const f = S.issuedFilter;
+  const rows = issuedRowsFor(f);
   const total = rows.reduce((s, r) => s + (Number(r.entry.total_cost) || 0), 0);
-  document.getElementById("view-distributed").innerHTML = `
+  const consumedTotal = rows.filter((r) => r.disp === "consumed").reduce((s, r) => s + (Number(r.entry.total_cost) || 0), 0);
+  const distributedTotal = total - consumedTotal;
+  document.getElementById("view-issued").innerHTML = `
     <div class="toolbar">
-      <input class="grow" id="distributedSearch" placeholder="Search stock no., recipient..." value="${esc(f.q)}"/>
-      <label style="margin:0;">From <input id="distributedFrom" type="date" value="${esc(f.from)}"/></label>
-      <label style="margin:0;">To <input id="distributedTo" type="date" value="${esc(f.to)}"/></label>
-      <div class="toolbar-right"><button class="btn" onclick="exportDistributedCsv()">Download CSV</button></div>
+      <input class="grow" id="issuedSearch" placeholder="Search stock no., office, recipient, RIS no..." value="${esc(f.q)}"/>
+      <select id="issuedTypeFilter">
+        <option value="" ${!f.type ? "selected" : ""}>Consumption + Distribution</option>
+        ${ISSUE_TYPES.map((t) => `<option value="${t.code}" ${f.type === t.code ? "selected" : ""}>${esc(t.label)} only</option>`).join("")}
+      </select>
+      <label style="margin:0;">From <input id="issuedFrom" type="date" value="${esc(f.from)}"/></label>
+      <label style="margin:0;">To <input id="issuedTo" type="date" value="${esc(f.to)}"/></label>
+      <div class="toolbar-right"><button class="btn" onclick="exportIssuedCsv()">Download CSV</button></div>
     </div>
-    <div class="cardrow" style="grid-template-columns: 1fr;">
-      <div class="card"><div class="label">Total Distributed</div><div class="value">${fmtMoney(total)}</div><div class="foot">${rows.length} issuance line(s)${f.from || f.to ? " in range" : ""}</div></div>
+    <div class="cardrow">
+      <div class="card"><div class="label">Total Issued</div><div class="value">${fmtMoney(total)}</div><div class="foot">${rows.length} issuance line(s)${f.from || f.to ? " in range" : ""}</div></div>
+      <div class="card"><div class="label">Consumption</div><div class="value">${fmtMoney(consumedTotal)}</div><div class="foot">used internally by offices</div></div>
+      <div class="card"><div class="label">Distribution</div><div class="value">${fmtMoney(distributedTotal)}</div><div class="foot">to barangays / beneficiaries / the public</div></div>
     </div>
     <div class="table-wrap"><table>
-      <thead><tr><th>Date</th><th>AR No.</th><th>Stock No.</th><th>Description</th><th class="num">Qty</th><th class="num">Amount</th><th>Recipient / Barangay</th></tr></thead>
+      <thead><tr><th>Date</th><th>RIS No.</th><th>Type</th><th>Stock No.</th><th>Description</th><th class="num">Qty</th><th class="num">Amount</th><th>Office / Recipient</th></tr></thead>
       <tbody>${rows.length ? rows.map((r) => `
         <tr class="clickable" onclick="openItemDetail('${r.item.id}')">
-          <td>${fmtDate(r.entry.date)}</td><td>${esc(r.entry.ref || "")}</td><td>${esc(r.item.stock_no)}</td><td>${esc(r.item.description)}</td>
+          <td>${fmtDate(r.entry.date)}</td><td>${esc(r.entry.ref || "")}</td>
+          <td><span class="pill ${r.disp === "distributed" ? "distributed" : "consumed"}">${r.disp === "distributed" ? "Distribution" : "Consumption"}</span></td>
+          <td>${esc(r.item.stock_no)}</td><td>${esc(r.item.description)}</td>
           <td class="num">${fmtNum(r.entry.qty)} ${esc(r.item.unit)}</td><td class="num">${fmtMoney(r.entry.total_cost)}</td>
-          <td>${esc(r.entry.recipient)}</td>
-        </tr>`).join("") : `<tr><td colspan="7"><div class="empty">No distributed issuances match this filter.</div></td></tr>`}</tbody>
+          <td>${esc(r.entry.recipient || r.entry.office || "")}</td>
+        </tr>`).join("") : `<tr><td colspan="8"><div class="empty">No issuances match this filter.</div></td></tr>`}</tbody>
     </table></div>`;
-  document.getElementById("distributedSearch").addEventListener("input", (e) => { S.distributedFilter.q = e.target.value; renderDistributed(); });
-  document.getElementById("distributedFrom").addEventListener("change", (e) => { S.distributedFilter.from = e.target.value; renderDistributed(); });
-  document.getElementById("distributedTo").addEventListener("change", (e) => { S.distributedFilter.to = e.target.value; renderDistributed(); });
+  document.getElementById("issuedSearch").addEventListener("input", (e) => { S.issuedFilter.q = e.target.value; renderIssued(); });
+  document.getElementById("issuedTypeFilter").addEventListener("change", (e) => { S.issuedFilter.type = e.target.value; renderIssued(); });
+  document.getElementById("issuedFrom").addEventListener("change", (e) => { S.issuedFilter.from = e.target.value; renderIssued(); });
+  document.getElementById("issuedTo").addEventListener("change", (e) => { S.issuedFilter.to = e.target.value; renderIssued(); });
+  restoreFocus(saved);
 }
 
-function exportDistributedCsv() {
-  const rows = distributedRowsFor(S.distributedFilter);
-  const header = ["Date", "AR No.", "Stock No.", "Description", "Qty", "Unit", "Amount", "Recipient"];
+function exportIssuedCsv() {
+  const rows = issuedRowsFor(S.issuedFilter);
+  const header = ["Date", "RIS No.", "Type", "Stock No.", "Description", "Qty", "Unit", "Unit Cost", "Amount", "Office", "Recipient"];
   const lines = [header.join(",")];
   for (const r of rows) {
-    lines.push([r.entry.date, r.entry.ref, r.item.stock_no, r.item.description, r.entry.qty, r.item.unit, r.entry.total_cost, r.entry.recipient].map(csvField).join(","));
+    lines.push([r.entry.date, r.entry.ref, r.disp === "distributed" ? "Distribution" : "Consumption", r.item.stock_no, r.item.description,
+      r.entry.qty, r.item.unit, r.entry.unit_cost, r.entry.total_cost, r.entry.office || "", r.entry.recipient || ""].map(csvField).join(","));
   }
-  browserDownload(`Distributed_Inventory_${S.currentFund}_${todayStr()}.csv`, lines.join("\n"), "text/csv");
+  browserDownload(`Issued_Inventory_${S.currentFund}_${todayStr()}.csv`, lines.join("\n"), "text/csv");
 }
 
 // ---------------------------------------------------------------------
@@ -1748,7 +2082,7 @@ function saveTbSnapshot() {
 // Users & Roles
 // ---------------------------------------------------------------------
 
-const TAB_KEYS = ["dashboard", "registry", "ris", "rsmi", "ar", "distributed", "reconciliation"];
+const TAB_KEYS = ["dashboard", "registry", "air", "ris", "rsmi", "issued", "reconciliation"];
 function summarizeRestrictions(role) {
   const t = role.tabs || {};
   const parts = [];
@@ -1852,8 +2186,9 @@ function submitChangePassword() {
 // ---------------------------------------------------------------------
 
 const RENDERERS = {
-  dashboard: renderDashboard, registry: renderRegistry, ris: renderRis, rsmi: renderRsmi, ar: renderAr,
-  distributed: renderDistributed, reconciliation: renderReconciliation, users: renderUsers,
+  dashboard: renderDashboard, registry: renderRegistry, air: renderAir,
+  ris: renderRis, rsmi: renderRsmi, issued: renderIssued,
+  reconciliation: renderReconciliation, users: renderUsers,
 };
 
 function renderAll() {
@@ -1914,7 +2249,7 @@ export function initApp(user) {
   colItems.onSnapshot((rows) => { S.items = new Map(rows.map((r) => [r.id, r])); renderAll(); });
   colRis.onSnapshot((rows) => { S.ris = new Map(rows.map((r) => [r.id, r])); renderAll(); });
   colRsmi.onSnapshot((rows) => { S.rsmi = new Map(rows.map((r) => [r.id, r])); renderAll(); });
-  colAr.onSnapshot((rows) => { S.ar = new Map(rows.map((r) => [r.id, r])); renderAll(); });
+  colAir.onSnapshot((rows) => { S.air = new Map(rows.map((r) => [r.id, r])); renderAll(); });
   colTb.onSnapshot((rows) => { S.tbSnapshots = new Map(rows.map((r) => [r.id, r])); renderAll(); });
   colRoles.onSnapshot((rows) => { S.userRoles = new Map(rows.map((r) => [r.id, r])); renderAll(); });
 }
@@ -1933,13 +2268,14 @@ function __setTestUser(user) {
 Object.assign(window, {
   setFund, setView, closeModal, __setTestUser, renderAll,
   openItemModal, saveItem, openItemDetail, discontinueItem, reactivateItem,
-  openReceiptModal, saveReceipt, printSlc, printSc, exportRegistryCsv,
+  printSlc, printSc, exportRegistryCsv,
+  openAirModal, saveAir, addAirLine, removeAirLine, openAirDetail, deleteAir,
+  openPostAirModal, confirmPostAir, unpostAir, printAir, exportAirCsv,
   openRisModal, saveRis, addRisLine, removeRisLine, openRisDetail, deleteRis,
-  openIssueRisModal, confirmIssueRis, reverseRis, printRis, exportRisCsv,
-  openArModal, saveAr, addArLine, removeArLine, openArDetail, deleteAr,
-  openIssueArModal, confirmIssueAr, reverseAr, printAr, exportArCsv,
+  toggleRisRecipientFields, openIssueRisModal, confirmIssueRis, reverseRis, printRis, exportRisCsv,
+  openBulkRisModal, downloadRisTemplate, previewBulkRis, importBulkRis,
   openGenerateRsmiModal, generateRsmi, openRsmiDetail, deleteRsmi, printRsmi, exportRsmiCsv,
-  exportDistributedCsv, saveTbSnapshot,
+  exportIssuedCsv, saveTbSnapshot,
   openUserRoleModal, saveUserRole, deleteUserRole,
   openChangePasswordModal, submitChangePassword,
 });
