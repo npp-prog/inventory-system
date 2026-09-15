@@ -1,0 +1,12 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Any signed-in user can read/write. There is no self-service sign-up - accounts are
+    // created by whoever administers this Firebase project, so this keeps access limited to
+    // office staff while staying simple. Per-tab View/Edit/Hidden restrictions are enforced by
+    // the app itself (Users & Roles), not by these rules - see README.md for that caveat.
+    match /{document=**} {
+      allow read, write: if request.auth != null;
+    }
+  }
+}

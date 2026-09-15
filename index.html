@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Inventory Management System (IMS)</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400;500;700&display=swap">
+<link rel="stylesheet" href="css/styles.css" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+</head>
+<body>
+
+<div id="signinScreen">
+  <div class="signin-card">
+    <div class="seal">
+      <div class="mark">M</div>
+      <h1>Inventory Management System (IMS)</h1>
+      <div class="sub">MGO &middot; Candoni</div>
+    </div>
+    <div id="signinError" class="err-box" hidden></div>
+    <form id="signinForm">
+      <label for="signinEmail">Email</label>
+      <input id="signinEmail" type="email" autocomplete="username" required />
+      <label for="signinPassword">Password</label>
+      <input id="signinPassword" type="password" autocomplete="current-password" required />
+      <button class="btn primary block" style="margin-top:16px;" type="submit">Sign in</button>
+    </form>
+    <div class="center small" style="margin-top:10px;">
+      <a href="#" id="forgotPasswordLink">Forgot password?</a>
+    </div>
+    <div class="hr"></div>
+    <button id="googleSigninBtn" class="btn block" type="button">Sign in with Google</button>
+    <p class="small center" style="margin-top:14px;">
+      Accounts are created by your Firebase project administrator &mdash; there is no self-service sign-up.
+    </p>
+  </div>
+</div>
+
+<div id="appScreen" hidden>
+  <aside id="sidebar">
+    <div class="brand">
+      <div class="seal">
+        <div class="mark">M</div>
+        <h1>Inventory Management<br/>System (IMS)</h1>
+        <div class="sub">MGO &middot; Candoni</div>
+      </div>
+    </div>
+
+    <div id="fundSwitch"></div>
+
+    <nav id="mainNav">
+      <button data-view="dashboard"><span class="ico">01</span> Dashboard</button>
+      <button data-view="registry"><span class="ico">02</span> Inventory Registry</button>
+      <button data-view="ris"><span class="ico">03</span> RIS</button>
+      <button data-view="rsmi"><span class="ico">04</span> RSMI</button>
+      <button data-view="consumed"><span class="ico">05</span> Consumed Inventory</button>
+      <button data-view="distributed"><span class="ico">06</span> Distributed Inventory</button>
+      <button data-view="reconciliation"><span class="ico">07</span> Reconciliation</button>
+      <button data-view="users"><span class="ico">08</span> Users &amp; Roles</button>
+    </nav>
+
+    <div class="auth-chip">
+      <span class="email" id="whoami"></span>
+      <button class="btn ghost" id="changePasswordBtn" type="button">Change password</button>
+      <button class="btn ghost" id="signOutBtn" type="button">Sign out</button>
+    </div>
+  </aside>
+
+  <div id="main">
+    <div id="topbar">
+      <h2 id="viewTitle">Dashboard</h2>
+    </div>
+    <div id="content">
+      <div class="view" id="view-dashboard"></div>
+      <div class="view" id="view-registry"></div>
+      <div class="view" id="view-ris"></div>
+      <div class="view" id="view-rsmi"></div>
+      <div class="view" id="view-consumed"></div>
+      <div class="view" id="view-distributed"></div>
+      <div class="view" id="view-reconciliation"></div>
+      <div class="view" id="view-users"></div>
+    </div>
+  </div>
+</div>
+
+<div id="modalRoot"></div>
+<div class="toast-wrap" id="toastRoot"></div>
+
+<script type="module" src="js/main.js"></script>
+</body>
+</html>

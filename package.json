@@ -1,0 +1,15 @@
+{
+  "name": "ims-candoni",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Inventory Management System (IMS) - MGO Candoni. Seed scripts only; the app itself needs no build step.",
+  "type": "module",
+  "scripts": {
+    "seed": "node scripts/seed.mjs",
+    "seed:client": "node scripts/seed-client.mjs"
+  },
+  "dependencies": {
+    "firebase": "^10.13.0",
+    "firebase-admin": "^12.6.0"
+  }
+}
