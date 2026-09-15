@@ -72,14 +72,13 @@ export const RETIRE_REASONS = [
 
 const HARDCODED_ADMIN_EMAILS = ["npp@mgocandoniaccounting.org"];
 const EDITABLE_TABS = ["registry", "ris", "rsmi", "ar", "reconciliation"];
-const VIEW_ONLY_TABS = ["dashboard", "consumed", "distributed"];
+const VIEW_ONLY_TABS = ["dashboard", "distributed"];
 const VIEW_TITLES = {
   dashboard: "Dashboard",
   registry: "Inventory Registry",
   ris: "Requisition and Issue Slip (RIS)",
   rsmi: "Report of Supplies and Materials Issued (RSMI)",
   ar: "Acknowledgement Receipt",
-  consumed: "Consumed Inventory",
   distributed: "Distributed Inventory",
   reconciliation: "Reconciliation",
   users: "Users & Roles",
@@ -102,7 +101,6 @@ const S = {
   registryFilter: { q: "", account: "", disposition: "", status: "active" },
   risFilter: { q: "", status: "" },
   arFilter: { q: "", status: "" },
-  consumedFilter: { q: "", from: "", to: "" },
   distributedFilter: { q: "", from: "", to: "" },
   reconPeriod: null,
   _billingDraftUnused: null,
@@ -1589,22 +1587,25 @@ function exportRsmiCsv(id) {
 }
 
 // ---------------------------------------------------------------------
-// Consumed Inventory / Distributed Inventory (issuance reports)
+// Distributed Inventory (issuance report) - RSMI already serves as Consumed Inventory's own
+// report (a recap of every issued RIS line), so there is no separate "Report" item under the
+// Consumed Inventory group; this report exists only for Distributed Inventory / Acknowledgement
+// Receipts, which have no equivalent recap document.
 // ---------------------------------------------------------------------
 
-function issuanceRowsFor(disposition, f) {
+function distributedRowsFor(f) {
   const fund = S.currentFund;
   const rows = [];
   for (const a of S.items.values()) {
     if (a.fund !== fund) continue;
     for (const e of a.ledger || []) {
       if (e.type !== "issue") continue;
-      if ((e.disposition || (isDistributionAccount(a.account_code) ? "distributed" : "consumed")) !== disposition) continue;
+      if ((e.disposition || (isDistributionAccount(a.account_code) ? "distributed" : "consumed")) !== "distributed") continue;
       if (f.from && e.date < f.from) continue;
       if (f.to && e.date > f.to) continue;
       if (f.q) {
         const q = f.q.toLowerCase();
-        if (![a.stock_no, a.description, e.office, e.recipient, e.ref].some((v) => (v || "").toLowerCase().includes(q))) continue;
+        if (![a.stock_no, a.description, e.recipient, e.ref].some((v) => (v || "").toLowerCase().includes(q))) continue;
       }
       rows.push({ item: a, entry: e });
     }
@@ -1613,48 +1614,42 @@ function issuanceRowsFor(disposition, f) {
   return rows;
 }
 
-function renderIssuanceView(kind) {
-  const viewId = kind === "consumed" ? "view-consumed" : "view-distributed";
-  const filterKey = kind === "consumed" ? "consumedFilter" : "distributedFilter";
-  const f = S[filterKey];
-  const rows = issuanceRowsFor(kind, f);
+function renderDistributed() {
+  const f = S.distributedFilter;
+  const rows = distributedRowsFor(f);
   const total = rows.reduce((s, r) => s + (Number(r.entry.total_cost) || 0), 0);
-  const extraCol = kind === "distributed" ? "<th>Recipient / Barangay</th>" : "<th>Office</th>";
-  document.getElementById(viewId).innerHTML = `
+  document.getElementById("view-distributed").innerHTML = `
     <div class="toolbar">
-      <input class="grow" id="${kind}Search" placeholder="Search stock no., office, recipient..." value="${esc(f.q)}"/>
-      <label style="margin:0;">From <input id="${kind}From" type="date" value="${esc(f.from)}"/></label>
-      <label style="margin:0;">To <input id="${kind}To" type="date" value="${esc(f.to)}"/></label>
-      <div class="toolbar-right"><button class="btn" onclick="exportIssuanceCsv('${kind}')">Download CSV</button></div>
+      <input class="grow" id="distributedSearch" placeholder="Search stock no., recipient..." value="${esc(f.q)}"/>
+      <label style="margin:0;">From <input id="distributedFrom" type="date" value="${esc(f.from)}"/></label>
+      <label style="margin:0;">To <input id="distributedTo" type="date" value="${esc(f.to)}"/></label>
+      <div class="toolbar-right"><button class="btn" onclick="exportDistributedCsv()">Download CSV</button></div>
     </div>
     <div class="cardrow" style="grid-template-columns: 1fr;">
-      <div class="card"><div class="label">Total ${kind === "consumed" ? "Consumed" : "Distributed"}</div><div class="value">${fmtMoney(total)}</div><div class="foot">${rows.length} issuance line(s)${f.from || f.to ? " in range" : ""}</div></div>
+      <div class="card"><div class="label">Total Distributed</div><div class="value">${fmtMoney(total)}</div><div class="foot">${rows.length} issuance line(s)${f.from || f.to ? " in range" : ""}</div></div>
     </div>
     <div class="table-wrap"><table>
-      <thead><tr><th>Date</th><th>RIS No.</th><th>Stock No.</th><th>Description</th><th class="num">Qty</th><th class="num">Amount</th>${extraCol}</tr></thead>
+      <thead><tr><th>Date</th><th>AR No.</th><th>Stock No.</th><th>Description</th><th class="num">Qty</th><th class="num">Amount</th><th>Recipient / Barangay</th></tr></thead>
       <tbody>${rows.length ? rows.map((r) => `
         <tr class="clickable" onclick="openItemDetail('${r.item.id}')">
           <td>${fmtDate(r.entry.date)}</td><td>${esc(r.entry.ref || "")}</td><td>${esc(r.item.stock_no)}</td><td>${esc(r.item.description)}</td>
           <td class="num">${fmtNum(r.entry.qty)} ${esc(r.item.unit)}</td><td class="num">${fmtMoney(r.entry.total_cost)}</td>
-          <td>${esc(kind === "distributed" ? r.entry.recipient : r.entry.office)}</td>
-        </tr>`).join("") : `<tr><td colspan="7"><div class="empty">No ${kind} issuances match this filter.</div></td></tr>`}</tbody>
+          <td>${esc(r.entry.recipient)}</td>
+        </tr>`).join("") : `<tr><td colspan="7"><div class="empty">No distributed issuances match this filter.</div></td></tr>`}</tbody>
     </table></div>`;
-  document.getElementById(`${kind}Search`).addEventListener("input", (e) => { S[filterKey].q = e.target.value; renderIssuanceView(kind); });
-  document.getElementById(`${kind}From`).addEventListener("change", (e) => { S[filterKey].from = e.target.value; renderIssuanceView(kind); });
-  document.getElementById(`${kind}To`).addEventListener("change", (e) => { S[filterKey].to = e.target.value; renderIssuanceView(kind); });
+  document.getElementById("distributedSearch").addEventListener("input", (e) => { S.distributedFilter.q = e.target.value; renderDistributed(); });
+  document.getElementById("distributedFrom").addEventListener("change", (e) => { S.distributedFilter.from = e.target.value; renderDistributed(); });
+  document.getElementById("distributedTo").addEventListener("change", (e) => { S.distributedFilter.to = e.target.value; renderDistributed(); });
 }
-function renderConsumed() { renderIssuanceView("consumed"); }
-function renderDistributed() { renderIssuanceView("distributed"); }
 
-function exportIssuanceCsv(kind) {
-  const f = kind === "consumed" ? S.consumedFilter : S.distributedFilter;
-  const rows = issuanceRowsFor(kind, f);
-  const header = ["Date", "RIS No.", "Stock No.", "Description", "Qty", "Unit", "Amount", kind === "distributed" ? "Recipient" : "Office"];
+function exportDistributedCsv() {
+  const rows = distributedRowsFor(S.distributedFilter);
+  const header = ["Date", "AR No.", "Stock No.", "Description", "Qty", "Unit", "Amount", "Recipient"];
   const lines = [header.join(",")];
   for (const r of rows) {
-    lines.push([r.entry.date, r.entry.ref, r.item.stock_no, r.item.description, r.entry.qty, r.item.unit, r.entry.total_cost, kind === "distributed" ? r.entry.recipient : r.entry.office].map(csvField).join(","));
+    lines.push([r.entry.date, r.entry.ref, r.item.stock_no, r.item.description, r.entry.qty, r.item.unit, r.entry.total_cost, r.entry.recipient].map(csvField).join(","));
   }
-  browserDownload(`${kind === "consumed" ? "Consumed" : "Distributed"}_Inventory_${S.currentFund}_${todayStr()}.csv`, lines.join("\n"), "text/csv");
+  browserDownload(`Distributed_Inventory_${S.currentFund}_${todayStr()}.csv`, lines.join("\n"), "text/csv");
 }
 
 // ---------------------------------------------------------------------
@@ -1753,7 +1748,7 @@ function saveTbSnapshot() {
 // Users & Roles
 // ---------------------------------------------------------------------
 
-const TAB_KEYS = ["dashboard", "registry", "ris", "rsmi", "ar", "consumed", "distributed", "reconciliation"];
+const TAB_KEYS = ["dashboard", "registry", "ris", "rsmi", "ar", "distributed", "reconciliation"];
 function summarizeRestrictions(role) {
   const t = role.tabs || {};
   const parts = [];
@@ -1858,7 +1853,7 @@ function submitChangePassword() {
 
 const RENDERERS = {
   dashboard: renderDashboard, registry: renderRegistry, ris: renderRis, rsmi: renderRsmi, ar: renderAr,
-  consumed: renderConsumed, distributed: renderDistributed, reconciliation: renderReconciliation, users: renderUsers,
+  distributed: renderDistributed, reconciliation: renderReconciliation, users: renderUsers,
 };
 
 function renderAll() {
@@ -1944,7 +1939,7 @@ Object.assign(window, {
   openArModal, saveAr, addArLine, removeArLine, openArDetail, deleteAr,
   openIssueArModal, confirmIssueAr, reverseAr, printAr, exportArCsv,
   openGenerateRsmiModal, generateRsmi, openRsmiDetail, deleteRsmi, printRsmi, exportRsmiCsv,
-  exportIssuanceCsv, saveTbSnapshot,
+  exportDistributedCsv, saveTbSnapshot,
   openUserRoleModal, saveUserRole, deleteUserRole,
   openChangePasswordModal, submitChangePassword,
 });
