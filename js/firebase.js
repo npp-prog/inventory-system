@@ -2,7 +2,7 @@
 // Loaded as an ES module. Uses the Firebase v10 modular CDN build so nothing needs npm-installing
 // to run the app itself (only the seed scripts, which run under Node, need `npm install`).
 import { firebaseConfig, allowedEmailDomains } from "./firebase-config.js";
-import { emailAllowedBy } from "./allowlist.js";
+import { isEmailAllowed } from "./allowlist.js";
 import {
   initializeApp,
 } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-app.js";
@@ -27,6 +27,8 @@ import {
   setDoc,
   updateDoc,
   deleteDoc,
+  addDoc,
+  getDoc,
   onSnapshot,
   serverTimestamp,
 } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore.js";
@@ -71,7 +73,7 @@ export function completeGoogleRedirect() {
 // project accepts - including any Google account. Fill it in only if you later want to narrow
 // that; see README, "Google sign-in".
 export function isAllowedAccount(user) {
-  return emailAllowedBy(user && user.email, allowedEmailDomains);
+  return isEmailAllowed(user && user.email, allowedEmailDomains);
 }
 
 export function signOut() {
@@ -99,14 +101,23 @@ function wrapDoc(colName, id) {
   const ref = doc(db, colName, id);
   return {
     id,
+    // get() is used by the sign-in approval gate (checkOrRegisterApproval in app.js) to read one
+    // role doc directly, rather than waiting for the whole-collection listener to arrive.
+    get: async () => {
+      const snap = await getDoc(ref);
+      return { id: snap.id, exists: snap.exists(), data: () => snap.data() };
+    },
     set: (data) => setDoc(ref, data, { merge: false }),
     update: (data) => updateDoc(ref, data),
     delete: () => deleteDoc(ref),
+    onSnapshot: (next, err) => onSnapshot(ref, (snap) => next({ id: snap.id, exists: snap.exists(), data: () => snap.data() }), err),
   };
 }
 
 export function fsCollection(colName) {
   return {
+    // add() appends a doc with a generated id - used by the append-only auditLog.
+    add: (data) => addDoc(collection(db, colName), data),
     doc(id) {
       if (id) return wrapDoc(colName, id);
       const ref = doc(collection(db, colName));

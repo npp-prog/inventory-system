@@ -1,12 +1,169 @@
 rules_version = '2';
+
+// ============================================================================================
+// Inventory Management System (IMS) - Firestore security rules
+//
+// Sept 2026 hardening pass, ported from the PPE Ledger (ppe-ledger) rules of 2026-09-17 so both
+// municipal systems enforce access the same way. The previous version - kept beside this file as
+// firestore.rules.backup-2026-09-18 - was a single blanket rule: any signed-in user could read and
+// write every collection. This version:
+//
+//   1. DENIES BY DEFAULT. Only the collections matched below are reachable at all. A typo'd or
+//      future collection nobody wrote a rule for is denied, not silently allowed.
+//   2. Adds the PENDING-APPROVAL GATE for Google sign-ins. In PMS an unapproved Google account
+//      reached a full dashboard just by signing in; the same hole existed here. A Google-signed-in
+//      user now needs a user_roles/{email} doc with approved:true. Email/password accounts are
+//      exempt - an Admin creating the account in the Firebase console IS the approval.
+//   3. Mirrors the app's per-tab roles AT THE DATABASE LEVEL. Until now Hidden/View/Edit was only
+//      hidden menus in the browser and could be bypassed with dev tools. Each collection below is
+//      tied to the same tab key the app uses, and a write is refused unless that user's own
+//      user_roles doc grants "edit" on that tab.
+//   4. Defaults an unset role to NO ACCESS, matching DEFAULT_TAB_ACCESS = "none" in js/app.js.
+//      The two layers must agree; if you change one, change the other.
+//   5. Keeps the hardcoded Admin (npp@mgocandoniaccounting.org) fully privileged at all times, so
+//      a mistake in a role doc can never lock the office out of its own system.
+//   6. auditLog is append-only: create is allowed, update and delete are refused outright.
+//
+// !! DEPLOY ORDER MATTERS !!
+// Publishing this file BEFORE approving the people already using the app will lock them out at
+// their next page load. Run "Pre-approve existing users" in the app's Users & Roles tab first
+// (paste the list from Firebase Console -> Authentication -> Users). That is this app's stand-in
+// for PMS's grandfatherExistingUsers Cloud Function - IMS has no Cloud Functions.
+//
+// COST NOTE (deliberate tradeoff, flagged rather than silently avoided): because roles live in
+// Firestore rather than in custom auth claims, these rules call get() on the caller's user_roles
+// doc to decide a write. Firestore bills one document read per get(), and rules-evaluation reads
+// are billed like any other read. Reads are unaffected (no get() on the read path beyond the role
+// lookup itself). At this office's volume that is pennies; at much higher write volume the fix is
+// to move roles into custom claims via a Cloud Function, which would also remove the get() calls.
+// Note also each rules evaluation allows at most 10 get()/exists() calls for a single-document
+// request - the helpers below stay well inside that.
+//
+// Publish with the Firebase CLI:  firebase deploy --only firestore:rules
+// or paste into Firebase Console -> Firestore Database -> Rules -> Publish.
+// Before publishing, diff this against whatever is CURRENTLY live in the Console - this file was
+// written without being able to read the deployed version.
+// ============================================================================================
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Any signed-in user can read/write. There is no self-service sign-up - accounts are
-    // created by whoever administers this Firebase project, so this keeps access limited to
-    // office staff while staying simple. Per-tab View/Edit/Hidden restrictions are enforced by
-    // the app itself (Users & Roles), not by these rules - see README.md for that caveat.
-    match /{document=**} {
-      allow read, write: if request.auth != null;
+
+    // ---------- identity helpers ----------
+    function isSignedIn() {
+      return request.auth != null;
     }
+    function callerEmail() {
+      return request.auth.token.email.lower();
+    }
+    // Mirrors HARDCODED_ADMIN_EMAILS in js/app.js - keep the two in sync.
+    function isHardcodedAdmin() {
+      return isSignedIn() && callerEmail() == "npp@mgocandoniaccounting.org";
+    }
+    // Email/password accounts only exist because an Admin created them in the Firebase console
+    // (this app has no self-service sign-up), so the account itself is the approval. Only the
+    // "Sign in with Google" path is open to anyone, which is why it alone needs the gate below.
+    function isPasswordSignIn() {
+      return isSignedIn() && request.auth.token.firebase.sign_in_provider == "password";
+    }
+    function roleDoc() {
+      return get(/databases/$(database)/documents/user_roles/$(callerEmail())).data;
+    }
+    function hasRoleDoc() {
+      return exists(/databases/$(database)/documents/user_roles/$(callerEmail()));
+    }
+    // Opt-in kill switch: only blocks someone whose role doc explicitly says active:false, so no
+    // existing user is newly blocked by this. Lets you cut off a departed staff member without
+    // deleting their role or touching their Firebase Auth account.
+    function isActive() {
+      return !hasRoleDoc() || roleDoc().get('active', true) == true;
+    }
+    function isApproved() {
+      return isHardcodedAdmin() || isPasswordSignIn()
+        || (hasRoleDoc() && roleDoc().get('approved', false) == true);
+    }
+    function isAllowed() {
+      return isSignedIn() && isApproved() && isActive();
+    }
+    function isRoleAdmin() {
+      return isHardcodedAdmin() || (hasRoleDoc() && roleDoc().get('is_admin', false) == true);
+    }
+
+    // ---------- per-tab permissions, mirroring tabAccess() in js/app.js ----------
+    // DEFAULT_TAB_ACCESS = "none": a user with no role doc, or a role doc that doesn't mention
+    // this tab, gets nothing until an Admin grants it.
+    function tabLevel(tabKey) {
+      return isRoleAdmin()
+        ? 'edit'
+        : (hasRoleDoc() ? roleDoc().get('tabs', {}).get(tabKey, 'none') : 'none');
+    }
+    function canRead(tabKey) {
+      return isAllowed() && tabLevel(tabKey) != 'none';
+    }
+    function canEdit(tabKey) {
+      return isAllowed() && tabLevel(tabKey) == 'edit';
+    }
+
+    // ---------- the register itself ----------
+    // Items are read by every screen in the app (Dashboard, Medicines, Issuance reports all walk
+    // the same item ledger), so reads follow the Registry tab while writes require Edit on the tab
+    // whose action produced them: Acceptance posts receipts, RIS posts issuances, and the Registry
+    // itself covers opening balances and item edits. Rules cannot tell those three apart on a
+    // single update() without re-implementing the ledger diff, so a write is allowed if the caller
+    // has Edit on ANY of the three - narrower than "any signed-in user" by a wide margin, and
+    // honest about where it stops.
+    function itemQtyValid() {
+      return !('unit_cost' in request.resource.data) || request.resource.data.unit_cost == null
+        || (request.resource.data.unit_cost is number && request.resource.data.unit_cost >= 0);
+    }
+    match /items/{itemId} {
+      allow read: if isAllowed() && (tabLevel('registry') != 'none' || tabLevel('medicines') != 'none'
+                                    || tabLevel('dashboard') != 'none' || tabLevel('issued') != 'none');
+      allow create, update: if (canEdit('registry') || canEdit('air') || canEdit('ris')) && itemQtyValid();
+      allow delete: if canEdit('registry');
+    }
+
+    // ---------- documents, each tied to its own tab ----------
+    match /air/{id}  { allow read: if canRead('air');  allow write: if canEdit('air'); }
+    match /ris/{id}  { allow read: if canRead('ris');  allow write: if canEdit('ris'); }
+    match /rsmi/{id} { allow read: if canRead('rsmi'); allow write: if canEdit('rsmi'); }
+    match /tb_snapshots/{id} {
+      allow read: if canRead('reconciliation');
+      allow write: if canEdit('reconciliation');
+    }
+
+    // ---------- auditLog: append-only ----------
+    // The app only ever adds entries (logAudit() in js/app.js). Update and delete are refused so a
+    // written entry cannot be altered or removed from the browser. Reading is Admin-only - audit
+    // entries name who did what. Note this is tamper-EVIDENT, not tamper-PROOF: a determined user
+    // could still skip writing an entry, since the write happens in their browser. Making it
+    // unskippable means moving these writes into a Cloud Function.
+    match /auditLog/{entryId} {
+      allow create: if isAllowed();
+      allow read: if isAllowed() && isRoleAdmin();
+      allow update, delete: if false;
+    }
+
+    // ---------- user_roles: the sign-in gate, the role store, and the pending queue ----------
+    // Read stays open to any signed-in user on purpose: a brand-new, not-yet-approved Google
+    // sign-in must be able to read its OWN pending doc back to learn its status, and the app reads
+    // the collection to build the Access Role UI. Only writes are restricted.
+    match /user_roles/{id} {
+      allow read: if isSignedIn();
+
+      // Two ways a doc is created: (a) self-registration - a new Google sign-in may create ONLY
+      // its own doc (id must equal its own lowercased email) and only as a NOT-approved,
+      // NOT-admin pending request, so nobody can approve or promote themselves this way; or
+      // (b) an Admin creating a role for someone else.
+      allow create: if (isSignedIn()
+          && id == callerEmail()
+          && request.resource.data.get('approved', false) == false
+          && request.resource.data.get('is_admin', false) == false)
+        || (isAllowed() && isRoleAdmin());
+
+      // Approving, editing tabs, promoting an Admin, deleting a role: Admins only. Previously any
+      // signed-in user could rewrite anyone's role, including granting themselves Admin.
+      allow update, delete: if isAllowed() && isRoleAdmin();
+    }
+
+    // No catch-all match /{document=**} - anything not listed above is denied by default.
   }
 }

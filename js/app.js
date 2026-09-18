@@ -71,6 +71,14 @@ export const RETIRE_REASONS = [
 ];
 
 const HARDCODED_ADMIN_EMAILS = ["npp@mgocandoniaccounting.org"];
+// What a signed-in user gets on a tab nobody has granted them yet. "none" = the tab is hidden
+// entirely until an Admin grants "view" or "edit" in Users & Roles. MUST match DEFAULT_TAB_ACCESS
+// in firestore.rules, or the app and the database will disagree about who can do what.
+const DEFAULT_TAB_ACCESS = "none";
+// Quick-approving a pending request grants read-only access everywhere rather than nothing at all,
+// so "Approve" on its own produces a usable (but harmless) account. An Admin can then open the
+// same user and grant Edit per tab.
+const APPROVE_DEFAULT_LEVEL = "view";
 const EDITABLE_TABS = ["registry", "air", "ris", "rsmi", "reconciliation"];
 const VIEW_ONLY_TABS = ["dashboard", "medicines", "issued"];
 const VIEW_TITLES = {
@@ -146,6 +154,7 @@ const colRis = fsCollection("ris");
 const colRsmi = fsCollection("rsmi");
 const colTb = fsCollection("tb_snapshots");
 const colRoles = fsCollection("user_roles");
+const colAudit = fsCollection("auditLog");
 
 // ---------------------------------------------------------------------
 // Small helpers
@@ -225,23 +234,53 @@ function numberTaken(map, fund, numberField, value, excludeId) {
 // Access Role
 // ---------------------------------------------------------------------
 
+function currentEmailLower() { return (S.currentUser && S.currentUser.email || "").toLowerCase(); }
+function isHardcodedAdmin(email) {
+  return HARDCODED_ADMIN_EMAILS.some((e) => e.toLowerCase() === String(email || "").toLowerCase());
+}
 function isAdmin() {
-  const email = (S.currentUser && S.currentUser.email || "").toLowerCase();
-  if (HARDCODED_ADMIN_EMAILS.includes(email)) return true;
+  const email = currentEmailLower();
+  if (isHardcodedAdmin(email)) return true;
   const role = S.userRoles.get(email);
   return !!(role && role.is_admin);
 }
+/** Returns "edit" | "view" | "none" for `tabKey`, for the CURRENT signed-in user.
+ *  DEFAULT-DENY (changed Sept 2026, was default-allow-edit): being signed in no longer implies
+ *  being able to see or change anything. An Admin has to grant access deliberately, per tab, in
+ *  Users & Roles. Both defaulting paths land here - no role doc at all, AND a role doc that simply
+ *  omits this tab - so a tab added in a future version starts closed for existing roles instead of
+ *  silently inheriting edit. Mirrored server-side by firestore.rules' tabLevel(); the two must
+ *  agree, which is why DEFAULT_TAB_ACCESS is called out as a named constant on both sides. */
 function tabAccess(tabKey) {
   if (isAdmin()) return "edit";
-  const email = (S.currentUser && S.currentUser.email || "").toLowerCase();
-  const role = S.userRoles.get(email);
-  if (!role) return EDITABLE_TABS.includes(tabKey) ? "edit" : "view";
-  const t = role.tabs || {};
-  if (t[tabKey] === undefined || t[tabKey] === null) return EDITABLE_TABS.includes(tabKey) ? "edit" : "view";
-  return t[tabKey];
+  const role = S.userRoles.get(currentEmailLower());
+  if (!role) return DEFAULT_TAB_ACCESS;
+  const level = role.tabs && role.tabs[tabKey];
+  if (level === "none" || level === "view" || level === "edit") return level;
+  return DEFAULT_TAB_ACCESS;
 }
 function hasTabAccess(tabKey) { return tabAccess(tabKey) !== "none"; }
 function canEdit(tabKey) { return tabAccess(tabKey) === "edit"; }
+/** Append one entry to the append-only `auditLog` collection. Deliberately best-effort: a failure
+ *  here is logged and swallowed, so a hiccup writing the audit entry can never block or roll back
+ *  the real write it describes. firestore.rules allows create but refuses update/delete, so an
+ *  entry cannot be edited or removed from the browser once written. Full tamper-resistance would
+ *  need these writes moved server-side (Cloud Functions) - not in scope for this static app. */
+function logAudit(action, targetType, targetId, details) {
+  try {
+    const p = colAudit.add({
+      action, target_type: targetType, target_id: String(targetId || ""),
+      details: details || {},
+      fund: S.currentFund || null,
+      by_email: currentEmailLower(),
+      at: new Date().toISOString(),
+    });
+    if (p && p.catch) p.catch((e) => console.error("auditLog write failed (non-fatal):", e));
+  } catch (e) {
+    console.error("auditLog write failed (non-fatal):", e);
+  }
+}
+
 function blockIfViewOnly(tabKey) {
   if (!canEdit(tabKey)) {
     toast("You have view-only access to this section.", true);
@@ -829,7 +868,10 @@ function saveItem(id) {
     updated_at: Date.now(),
   };
   if (id) {
-    colItems.doc(id).update(rec).then(() => { toast("Item saved."); closeModal(); }).catch((e) => toast(e.message, true));
+    colItems.doc(id).update(rec).then(() => {
+      logAudit("item_update", "item", id, { stock_no: rec.stock_no, description: rec.description, account_code: rec.account_code });
+      toast("Item saved."); closeModal();
+    }).catch((e) => toast(e.message, true));
     return;
   }
   const openQtyEl = document.getElementById("f_openqty");
@@ -847,13 +889,19 @@ function saveItem(id) {
     if (!entry) { toast(`Stock No. ${stock_no} already exists in this fund.`, true); return; }
     const ledger = (existing.ledger || []).concat([entry]);
     colItems.doc(existing.id).update({ ledger, unit_cost: rec.unit_cost, status: "active", updated_at: Date.now() })
-      .then(() => { toast(`Opening balance filed inside the existing item ${stock_no}.`); closeModal(); })
+      .then(() => {
+        logAudit("item_opening_balance", "item", existing.id, { stock_no, qty: openQty, unit_cost: rec.unit_cost });
+        toast(`Opening balance filed inside the existing item ${stock_no}.`); closeModal();
+      })
       .catch((e) => toast(e.message, true));
     return;
   }
   rec.created_at = Date.now();
   rec.ledger = entry ? [entry] : [];
-  colItems.doc().set(rec).then(() => { toast("Item added."); closeModal(); }).catch((e) => toast(e.message, true));
+  colItems.doc().set(rec).then(() => {
+    logAudit("item_create", "item", rec.stock_no, { description: rec.description, account_code: rec.account_code, opening_qty: openQty });
+    toast("Item added."); closeModal();
+  }).catch((e) => toast(e.message, true));
 }
 
 function round2(n) { return Math.round((Number(n) || 0) * 100) / 100; }
@@ -863,11 +911,17 @@ function discontinueItem(id) {
   const a = S.items.get(id);
   if (!a) return;
   if (qtyBalance(a) > 0 && !confirm(`${a.description} still has ${fmtNum(qtyBalance(a))} ${a.unit} on hand. Discontinue anyway?`)) return;
-  colItems.doc(id).update({ status: "discontinued" }).then(() => { toast("Item discontinued."); closeModal(); }).catch((e) => toast(e.message, true));
+  colItems.doc(id).update({ status: "discontinued" }).then(() => {
+    logAudit("item_discontinue", "item", id, { stock_no: a.stock_no, balance_qty: qtyBalance(a) });
+    toast("Item discontinued."); closeModal();
+  }).catch((e) => toast(e.message, true));
 }
 function reactivateItem(id) {
   if (blockIfViewOnly("registry")) return;
-  colItems.doc(id).update({ status: "active" }).then(() => { toast("Item reactivated."); closeModal(); }).catch((e) => toast(e.message, true));
+  colItems.doc(id).update({ status: "active" }).then(() => {
+    logAudit("item_reactivate", "item", id, {});
+    toast("Item reactivated."); closeModal();
+  }).catch((e) => toast(e.message, true));
 }
 
 function openItemDetail(id) {
@@ -1380,7 +1434,13 @@ function confirmIssueRis(id) {
   }
   Promise.all(writes)
     .then(() => colRis.doc(id).update({ lines, status: "issued", issued_at: Date.now(), issued_by_email: S.currentUser.email }))
-    .then(() => { toast(`RIS issued - stock updated (${issueTypeLabel(r.issue_type)}).`); closeModal(); })
+    .then(() => {
+      logAudit("ris_issue", "ris", r.ris_no, {
+        issue_type: r.issue_type || "consumption", issued_to: risIssuedTo(r),
+        lines: lines.filter((l) => l.qty_issued > 0).length,
+      });
+      toast(`RIS issued - stock updated (${issueTypeLabel(r.issue_type)}).`); closeModal();
+    })
     .catch((e) => toast(e.message, true));
 }
 
@@ -1397,7 +1457,10 @@ function reverseRis(id) {
   }
   Promise.all(writes)
     .then(() => colRis.doc(id).update({ status: "draft", issued_at: null, reversed_at: Date.now(), reversed_by: S.currentUser.email }))
-    .then(() => { toast("Issuance reversed."); closeModal(); })
+    .then(() => {
+      logAudit("ris_reverse", "ris", r.ris_no, { issue_type: r.issue_type || "consumption" });
+      toast("Issuance reversed."); closeModal();
+    })
     .catch((e) => toast(e.message, true));
 }
 
@@ -1964,7 +2027,10 @@ function confirmPostAir(id) {
   for (const doc of newDocs) writes.push(colItems.doc().set(doc));
   Promise.all(writes)
     .then(() => colAir.doc(id).update({ status: "posted", posted_at: Date.now(), posted_by: postedBy }))
-    .then(() => { toast("AIR received in Accounting - stock is now in the Inventory Registry."); closeModal(); })
+    .then(() => {
+      logAudit("air_post", "air", r.air_no, { lines: pending.size, value: airTotal(r), supplier: r.supplier || "" });
+      toast("AIR received in Accounting - stock is now in the Inventory Registry."); closeModal();
+    })
     .catch((e) => toast(e.message, true));
 }
 
@@ -1980,7 +2046,10 @@ function unpostAir(id) {
   }
   Promise.all(writes)
     .then(() => colAir.doc(id).update({ status: "for_accounting", posted_at: null, unposted_at: Date.now(), unposted_by: S.currentUser.email }))
-    .then(() => { toast("AIR unposted - the stock was removed from the registry."); closeModal(); })
+    .then(() => {
+      logAudit("air_unpost", "air", r.air_no, { lines: (r.lines || []).length, value: airTotal(r) });
+      toast("AIR unposted - the stock was removed from the registry."); closeModal();
+    })
     .catch((e) => toast(e.message, true));
 }
 
@@ -2262,7 +2331,10 @@ function generateRsmi() {
     posted_by_name: document.getElementById("rsmi_postby").value.trim(),
     created_at: Date.now(), created_by: S.currentUser.email,
   };
-  colRsmi.doc().set(rec).then(() => { toast("RSMI generated."); closeModal(); }).catch((e) => toast(e.message, true));
+  colRsmi.doc().set(rec).then(() => {
+    logAudit("rsmi_generate", "rsmi", rec.serial_no, { period_from: from, period_to: to, lines: lines.length, issue_type: onlyType || "all" });
+    toast("RSMI generated."); closeModal();
+  }).catch((e) => toast(e.message, true));
 }
 
 function openRsmiDetail(id) {
@@ -2286,7 +2358,10 @@ function openRsmiDetail(id) {
 function deleteRsmi(id) {
   if (blockIfViewOnly("rsmi")) return;
   if (!confirm("Delete this generated RSMI? (It can be regenerated from the same RIS records at any time.)")) return;
-  colRsmi.doc(id).delete().then(() => { toast("RSMI deleted."); closeModal(); }).catch((e) => toast(e.message, true));
+  colRsmi.doc(id).delete().then(() => {
+    logAudit("rsmi_delete", "rsmi", id, {});
+    toast("RSMI deleted."); closeModal();
+  }).catch((e) => toast(e.message, true));
 }
 function printRsmi(id) { openPrintWindow(rsmiHtml(S.rsmi.get(id)), "portrait"); }
 function exportRsmiCsv(id) {
@@ -2465,7 +2540,10 @@ function saveTbSnapshot() {
   const fund = S.currentFund;
   const id = fund === "GF" ? period : `${fund}__${period}`;
   colTb.doc(id).set({ fund, period, lines, saved_by: S.currentUser.email, saved_at: Date.now() })
-    .then(() => { S.reconPeriod = period; toast("Trial Balance saved."); renderReconciliation(); })
+    .then(() => {
+      logAudit("tb_save", "tb_snapshot", id, { period, lines: lines.length });
+      S.reconPeriod = period; toast("Trial Balance saved."); renderReconciliation();
+    })
     .catch((e) => toast(e.message, true));
 }
 
@@ -2484,23 +2562,122 @@ function summarizeRestrictions(role) {
   return parts.length ? parts.join(", ") : "Full access";
 }
 
+/** A self-registered Google sign-in that nobody has decided on yet - distinct from an older role
+ *  doc that simply predates the `approved` field, which counts as already settled. */
+function isPendingRequest(r) { return r.pending === true && r.approved !== true; }
+
 function renderUsers() {
   if (!isAdmin()) { document.getElementById("view-users").innerHTML = `<div class="empty">You don't have access to this section.</div>`; return; }
-  const roles = [...S.userRoles.values()];
+  const all = [...S.userRoles.values()].filter((r) => !isHardcodedAdmin(r.email || r.id));
+  const pending = all.filter(isPendingRequest).sort((a, b) => (a.requested_at || "").localeCompare(b.requested_at || ""));
+  const rows = all.filter((r) => !isPendingRequest(r)).sort((a, b) => (a.id || "").localeCompare(b.id || ""));
   document.getElementById("view-users").innerHTML = `
-    <div class="panel small">Access Role is app-level only: it hides menus/buttons here, but does not lock the underlying Firestore database itself - a technically determined person could still reach the data directly.</div>
+    <div class="panel small"><b>Before publishing the new Firestore rules:</b> use <b>Pre-approve existing users</b> below to approve everyone who already uses the system, so nobody is locked out the moment the rules go live. Get the list from Firebase Console &rarr; Authentication &rarr; Users.
+      <button class="btn" style="margin-left:8px;" onclick="openPreApproveModal()">Pre-approve existing users</button>
+    </div>
+    ${pending.length ? `
+    <div class="panel">
+      <h3>Pending sign-in requests <span class="small" style="font-weight:normal;">- ${pending.length} Google account(s) signed in but not yet approved. They see a "waiting for approval" screen and can read nothing until you decide.</span></h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Email</th><th>Name</th><th>Requested</th><th></th></tr></thead>
+        <tbody>${pending.map((r) => `
+          <tr>
+            <td>${esc(r.id)}</td>
+            <td>${esc(r.display_name || "")}</td>
+            <td>${esc((r.requested_at || "").slice(0, 10))}</td>
+            <td style="white-space:nowrap;">
+              <button class="btn primary" onclick="approveUserRole('${esc(r.id)}')">Approve (view only)</button>
+              <button class="btn" onclick="openUserRoleModal('${esc(r.id)}')">Approve with access…</button>
+              <button class="btn danger" onclick="denyPendingUser('${esc(r.id)}')">Deny</button>
+            </td>
+          </tr>`).join("")}
+        </tbody>
+      </table></div>
+    </div>` : ""}
+    <div class="panel small">Access here is enforced in two places now: this app hides menus and buttons, and <b>firestore.rules</b> independently refuses reads/writes that a person's role doesn't allow - so it can no longer be bypassed with browser dev tools.</div>
     <div class="toolbar"><div class="toolbar-right" style="margin-left:0;"><button class="btn primary" onclick="openUserRoleModal()">+ Add user</button></div></div>
     <div class="table-wrap"><table>
       <thead><tr><th>Email</th><th>Access</th><th></th></tr></thead>
       <tbody>
         ${HARDCODED_ADMIN_EMAILS.map((e) => `<tr><td>${esc(e)}</td><td>Permanent Admin</td><td></td></tr>`).join("")}
-        ${roles.map((r) => `<tr>
-          <td>${esc(r.id)}${r.is_admin ? " (Admin)" : ""}</td>
+        ${rows.map((r) => `<tr>
+          <td>${esc(r.id)}${r.is_admin ? " (Admin)" : ""}${r.sign_in_method === "google" ? ' <span class="pill muted">Google</span>' : ""}</td>
           <td>${r.is_admin ? "Full Admin" : esc(summarizeRestrictions(r))}</td>
           <td><button class="btn" onclick="openUserRoleModal('${r.id}')">Edit</button> <button class="btn danger" onclick="deleteUserRole('${r.id}')">Delete</button></td>
         </tr>`).join("")}
+        ${rows.length ? "" : `<tr><td colspan="3"><div class="empty">No roles yet. Until an Admin grants access here, a signed-in user sees no tabs at all.</div></td></tr>`}
       </tbody>
     </table></div>`;
+}
+
+/** Quick-approve: grants read-only access on every tab (APPROVE_DEFAULT_LEVEL) rather than nothing,
+ *  so a plain "Approve" produces a usable but harmless account. Edit access stays deliberate. */
+function approveUserRole(id) {
+  if (!isAdmin()) { toast("Admins only.", true); return; }
+  const tabs = {};
+  TAB_KEYS.forEach((k) => { tabs[k] = APPROVE_DEFAULT_LEVEL; });
+  colRoles.doc(id).update({
+    approved: true, pending: false, tabs,
+    approved_by: currentEmailLower(), approved_at: new Date().toISOString(),
+  }).then(() => {
+    logAudit("role_approve", "user_role", id, { level: APPROVE_DEFAULT_LEVEL });
+    toast("Approved - they have view-only access now.");
+  }).catch((e) => toast(e.message, true));
+}
+
+function denyPendingUser(id) {
+  if (!isAdmin()) { toast("Admins only.", true); return; }
+  if (!confirm(`Deny ${id}? They stay locked out - signing in again just creates a new pending request.`)) return;
+  colRoles.doc(id).delete().then(() => {
+    logAudit("role_deny", "user_role", id, {});
+    toast("Request denied.");
+  }).catch((e) => toast(e.message, true));
+}
+
+/** The IMS stand-in for the PMS grandfather Cloud Function. This app has no Cloud Functions, so
+ *  instead of reading Firebase Auth server-side, an Admin pastes the address list from
+ *  Firebase Console -> Authentication -> Users and each one is written as an approved role doc.
+ *  Run this BEFORE publishing the new rules and nobody experiences a lockout. Safe to re-run: an
+ *  address that already has a role doc is left exactly as it is. */
+function openPreApproveModal() {
+  if (!isAdmin()) { toast("Admins only.", true); return; }
+  openModal(`
+    <div class="modal-head"><h3>Pre-approve existing users</h3><button class="btn ghost" onclick="closeModal()">✕</button></div>
+    <div class="modal-body">
+      <p class="small">Open <b>Firebase Console &rarr; Authentication &rarr; Users</b>, copy the email column, and paste it below - one address per line (commas and spaces are fine too). Each one that doesn't already have a role gets an approved, <b>view-only</b> role so it keeps working when the new rules go live. Anyone already set up is left untouched.</p>
+      <label>Email addresses</label>
+      <textarea id="preapprove_emails" rows="8" placeholder="juan@mgocandoniaccounting.org&#10;maria@gmail.com"></textarea>
+      <label style="display:flex;align-items:center;gap:8px;margin-top:12px;"><input type="checkbox" id="preapprove_edit" style="width:auto;"/> Grant Edit access instead of view-only (only for staff who were actively encoding)</label>
+      <div id="preapprove_preview"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn primary" onclick="runPreApprove()">Pre-approve these accounts</button>
+    </div>`, "wide");
+}
+
+function runPreApprove() {
+  if (!isAdmin()) { toast("Admins only.", true); return; }
+  const raw = document.getElementById("preapprove_emails").value || "";
+  const level = document.getElementById("preapprove_edit").checked ? "edit" : "view";
+  const emails = [...new Set(raw.split(/[\s,;]+/).map((e) => e.trim().toLowerCase()).filter((e) => e.includes("@")))];
+  if (!emails.length) { toast("Paste at least one email address.", true); return; }
+  const fresh = emails.filter((e) => !S.userRoles.has(e) && !isHardcodedAdmin(e));
+  const skipped = emails.length - fresh.length;
+  if (!fresh.length) { toast(`Nothing to do - all ${emails.length} already have a role.`); return; }
+  const tabs = {};
+  TAB_KEYS.forEach((k) => { tabs[k] = level; });
+  const writes = fresh.map((email) => colRoles.doc(email).set({
+    email, is_admin: false, tabs, approved: true, pending: false,
+    sign_in_method: "pre-approved",
+    approved_by: currentEmailLower(), approved_at: new Date().toISOString(),
+    updated_at: Date.now(),
+  }));
+  Promise.all(writes).then(() => {
+    logAudit("role_preapprove", "user_role", "(bulk)", { count: fresh.length, level, skipped });
+    toast(`${fresh.length} account(s) pre-approved with ${level} access${skipped ? `, ${skipped} already had a role` : ""}.`);
+    closeModal();
+  }).catch((e) => toast(e.message, true));
 }
 
 function openUserRoleModal(email) {
@@ -2537,11 +2714,33 @@ function saveUserRole(existingEmail) {
   const is_admin = document.getElementById("role_admin").checked;
   const tabs = {};
   document.querySelectorAll(".role_tab").forEach((el) => { tabs[el.dataset.tabkey] = el.value; });
-  colRoles.doc(email).set({ is_admin, tabs, updated_at: Date.now() }).then(() => { toast("Access saved."); closeModal(); }).catch((e) => toast(e.message, true));
+  const existing = S.userRoles.get(email) || {};
+  // An Admin saving this modal IS the approval - whether that is a brand-new role or finalizing a
+  // pending Google request opened via "Approve with access…".
+  colRoles.doc(email).set({
+    ...existing, email, is_admin, tabs, approved: true, pending: false,
+    updated_by: currentEmailLower(), updated_at: Date.now(),
+  }).then(() => {
+    logAudit("role_save", "user_role", email, { is_admin, tabs });
+    toast("Access saved.");
+    closeModal();
+  }).catch((e) => toast(e.message, true));
 }
 function deleteUserRole(email) {
-  if (!confirm(`Remove ${email}'s custom access? They will revert to full access everywhere.`)) return;
-  colRoles.doc(email).delete().then(() => toast("Reverted to full access.")).catch((e) => toast(e.message, true));
+  if (!isAdmin()) { toast("Admins only.", true); return; }
+  const r = S.userRoles.get(email);
+  const isGoogleUser = r && r.sign_in_method === "google";
+  // Deleting means different things by sign-in method: a Google user's APPROVAL lives in this doc,
+  // so removing it locks them out again; an email/password account falls back to the default,
+  // which since Sept 2026 is no access rather than full access.
+  const msg = isGoogleUser
+    ? `Delete ${email}'s role? They signed in with Google, so this removes their approval - they are locked out until a new request is approved.`
+    : `Delete ${email}'s role? They will have no access to any tab until a new role grants it.`;
+  if (!confirm(msg)) return;
+  colRoles.doc(email).delete().then(() => {
+    logAudit("role_delete", "user_role", email, { was_google: !!isGoogleUser });
+    toast(isGoogleUser ? "Role deleted - that user is locked out until approved again." : "Role deleted - that user now has no access.");
+  }).catch((e) => toast(e.message, true));
 }
 
 // ---------------------------------------------------------------------
@@ -2631,8 +2830,76 @@ function bindStaticUI() {
   document.getElementById("changePasswordBtn").hidden = !!isGoogle;
 }
 
-export function initApp(user) {
+/** ---------- Google sign-in pending-approval gate ----------
+ *  Ported from the PPE Ledger (PMS), where an unapproved Google account - prioloneil@gmail.com -
+ *  reached a full Dashboard simply by signing in. A Google-signed-in user now needs an explicit
+ *  user_roles/{email} doc with approved:true before the app renders. Enforced here for a friendly
+ *  screen, and INDEPENDENTLY by firestore.rules' isApproved() so editing the page's JavaScript
+ *  gets an attacker nothing. Email/password accounts are exempt: they only exist because an Admin
+ *  created them in the Firebase console, so creating the account already was the approval.
+ *
+ *  A brand-new Google sign-in with no role doc self-registers a pending request as a side effect,
+ *  so it appears in Users & Roles without the Admin having to do anything first. */
+async function checkOrRegisterApproval(user) {
+  const email = (user.email || "").toLowerCase();
+  let snap;
+  try {
+    snap = await colRoles.doc(email).get();
+  } catch (e) {
+    console.error("Couldn't check approval status:", e);
+    return false;
+  }
+  if (snap.exists) return snap.data().approved === true;
+  try {
+    await colRoles.doc(email).set({
+      email, approved: false, pending: true,
+      display_name: user.displayName || "",
+      sign_in_method: "google",
+      requested_at: new Date().toISOString(),
+    });
+  } catch (e) {
+    console.error("Couldn't register a pending access request:", e);
+  }
+  return false;
+}
+
+/** Replaces the whole app shell with a blocking "waiting for approval" screen - no nav, no data,
+ *  nothing of the real app is rendered underneath. Watches the person's own role doc live, so the
+ *  moment an Admin approves them the page reloads itself into the real app. */
+function renderPendingApprovalScreen(email) {
+  const appScreen = document.getElementById("appScreen");
+  if (!appScreen) return;
+  appScreen.innerHTML = `
+    <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;width:100%;">
+      <div class="signin-card" style="text-align:center;">
+        <img class="signin-logo" src="assets/logo.png" alt="Municipality of Candoni" style="margin:0 auto 14px;"/>
+        <h1 style="font-size:17px;margin:0 0 6px;">Waiting for approval</h1>
+        <p class="small" style="margin:0 0 12px;">Signed in as <b>${esc(email)}</b></p>
+        <p class="small">Your access request has been sent to the Administrator. You'll be able to use the system as soon as it is approved - this page updates on its own, so there's no need to keep checking back.</p>
+        <button class="btn block" id="pendingSignOutBtn" style="margin-top:16px;">Sign out</button>
+      </div>
+    </div>`;
+  const btn = document.getElementById("pendingSignOutBtn");
+  if (btn) btn.addEventListener("click", () => { signOut().catch((e) => console.error(e)); });
+  try {
+    colRoles.doc(email).onSnapshot(
+      (snap) => { if (snap.exists && snap.data().approved === true) location.reload(); },
+      () => { /* non-fatal - worst case they refresh manually once approved */ }
+    );
+  } catch (e) { /* same */ }
+}
+
+export async function initApp(user) {
   S.currentUser = user;
+
+  // Gate first, before any app chrome is touched, so an unapproved account never sees a flash of
+  // the real thing. Only applies to Google sign-ins; see checkOrRegisterApproval() above.
+  const providerId = user.providerData && user.providerData[0] && user.providerData[0].providerId;
+  if (providerId === "google.com" && !isHardcodedAdmin(currentEmailLower())) {
+    const approved = await checkOrRegisterApproval(user);
+    if (!approved) { renderPendingApprovalScreen(currentEmailLower()); return; }
+  }
+
   bindStaticUI();
   setView(S.view);
   renderFundSwitch();
@@ -2643,6 +2910,7 @@ export function initApp(user) {
   colAir.onSnapshot((rows) => { S.air = new Map(rows.map((r) => [r.id, r])); renderAll(); });
   colTb.onSnapshot((rows) => { S.tbSnapshots = new Map(rows.map((r) => [r.id, r])); renderAll(); });
   colRoles.onSnapshot((rows) => { S.userRoles = new Map(rows.map((r) => [r.id, r])); renderAll(); });
+  logAudit("sign_in", "session", currentEmailLower(), { provider: providerId || "password" });
 }
 
 // Test-only hook (harmless in production): lets an automated test switch which user is "signed
@@ -2670,5 +2938,6 @@ Object.assign(window, {
   openGenerateRsmiModal, generateRsmi, openRsmiDetail, deleteRsmi, printRsmi, exportRsmiCsv,
   exportIssuedCsv, saveTbSnapshot,
   openUserRoleModal, saveUserRole, deleteUserRole,
+  approveUserRole, denyPendingUser, openPreApproveModal, runPreApprove,
   openChangePasswordModal, submitChangePassword,
 });
