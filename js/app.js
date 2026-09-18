@@ -772,7 +772,7 @@ function renderRegistry() {
       </select>
       <div class="toolbar-right">
         <button class="btn" onclick="exportRegistryCsv()">Download CSV</button>
-        ${canE ? `<button class="btn primary" onclick="openItemModal()">+ Add opening balance</button>` : ""}
+        ${canE ? `<button class="btn" onclick="openBulkOpeningModal()">⇪ Bulk opening balances</button><button class="btn primary" onclick="openItemModal()">+ Add opening balance</button>` : ""}
       </div>
     </div>
     <div class="cardrow" style="grid-template-columns: 1fr;">
@@ -905,6 +905,218 @@ function saveItem(id) {
 }
 
 function round2(n) { return Math.round((Number(n) || 0) * 100) / 100; }
+
+// ---------------------------------------------------------------------
+// Bulk upload of opening balances
+//
+// Onboarding a year's closing stock one item at a time is hours of typing, so the same upload
+// pattern used for AIR and RIS is offered here. Two rules make this safe to run against live data:
+//
+//   1. ONE ITEM PER STOCK NO. Rows sharing a Stock/Property No. do not become separate rows in the
+//      registry - they become one item carrying one opening receipt per row. That is what lets a
+//      stock number whose stock was bought at two different prices keep both costs, instead of
+//      being flattened into an average that would no longer tie to the schedule it came from.
+//   2. NEVER TWICE. An item that already carries an opening balance is refused, by name, in the
+//      preview. Re-running an import is the obvious way to silently double a year's opening stock,
+//      and the person doing it would have no reason to suspect anything went wrong.
+// ---------------------------------------------------------------------
+
+const BULK_OPENING_HEADERS = ["Stock No.", "Description", "Item/Category", "Unit", "Qty", "Unit Cost",
+  "Account Code", "As of Date", "Expense Account Code", "Expense Account Name", "Re-order Point",
+  "Batch No.", "Expiry"];
+let _bulkOpeningParsed = null;
+// The ledger ref that marks a receipt as an opening balance rather than a delivery. saveItem()
+// writes this same string for a single manually-added opening balance.
+const OPENING_REF = "Opening balance";
+
+/** True if this item already carries an opening balance - the guard against a double import. */
+function hasOpeningBalance(item) {
+  return ((item && item.ledger) || []).some((e) => e.type === "receipt" && String(e.ref || "") === OPENING_REF);
+}
+
+function downloadOpeningTemplate() {
+  const asOf = `${new Date().getFullYear()}-01-01`;
+  const sample = [
+    ["04-02-007-ST0001", "TRICYCLE STICKER", "STICKER", "PCS", "300", "34.00", "10404020", asOf,
+      "50203020", "Accountable Forms Expenses", "0", "", ""],
+    ["MED-0001", "Paracetamol 500mg Tablet", "DRUGS AND MEDICINES", "TABLET", "5000", "2.00",
+      "10404060", asOf, "50203070", "Drugs and Medicines Expenses", "0", "LOT-2025-A", "2027-06-30"],
+  ];
+  const lines = [BULK_OPENING_HEADERS.join(",")].concat(sample.map((r) => r.map(csvField).join(",")));
+  browserDownload("Opening_balance_upload_template.csv", lines.join("\n"), "text/csv");
+}
+
+function openBulkOpeningModal() {
+  if (!canEdit("registry")) { toast("You have view-only access to Inventory Registry.", true); return; }
+  _bulkOpeningParsed = null;
+  openModal(`
+    <div class="modal-head"><h3>Bulk upload opening balances</h3><button class="btn ghost" onclick="closeModal()">✕</button></div>
+    <div class="modal-body">
+      <p class="small">One row per <b>lot</b> of stock already on the shelf. Rows sharing a <b>Stock/Property No.</b> become a <i>single</i> registry item holding one opening receipt each - so a stock number bought at two different unit costs keeps both, and still ties to your schedule. This loads into <b>${esc(fundLabel(S.currentFund))}</b>.</p>
+      <p class="small"><b>Columns:</b> ${BULK_OPENING_HEADERS.join(" &middot; ")}</p>
+      <p class="small"><b>Account Code</b> must be in the chart of accounts (e.g. 10404020). An item already in the registry inherits its own; a <i>new</i> one with no account code is skipped rather than guessed at, because an opening balance in the wrong account misstates that account all year. <b>Batch No.</b> and <b>Expiry</b> apply to medicines (${MEDICINE_ACCOUNTS.join(", ")}) and are ignored elsewhere. Any item that <i>already</i> has an opening balance is listed as skipped rather than added twice.</p>
+      <button class="btn" onclick="downloadOpeningTemplate()">⇩ Download blank template (CSV)</button>
+      <div class="hr"></div>
+      <label>Upload a file (.xlsx / .xls / .csv)</label><input id="bulkOpenFile" type="file" accept=".xlsx,.xls,.csv"/>
+      <label>...or paste rows (tab- or comma-delimited, header row optional)</label>
+      <textarea id="bulkOpenPaste" rows="7" placeholder="Stock No.&#9;Description&#9;Item/Category&#9;Unit&#9;Qty&#9;Unit Cost&#9;..."></textarea>
+      <div id="bulkOpenPreview"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn" onclick="previewBulkOpening()">Check rows</button>
+      <button class="btn primary" onclick="importBulkOpening()">Import opening balances</button>
+    </div>`, "wide");
+  const fileEl = document.getElementById("bulkOpenFile");
+  fileEl.addEventListener("change", () => {
+    const file = fileEl.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const wb = window.XLSX.read(ev.target.result, { type: "array" });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        const rowsArr = window.XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: "" });
+        document.getElementById("bulkOpenPaste").value = rowsArr.map((r) => (r || []).slice(0, BULK_OPENING_HEADERS.length).join("\t")).join("\n");
+        previewBulkOpening();
+      } catch (e) { toast("Could not read that file.", true); }
+    };
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+function parseBulkOpeningText(text) {
+  const fund = S.currentFund;
+  const errors = [];
+  const byStock = new Map();
+  const rawLines = text.split("\n").map((l) => l.replace(/\r$/, "")).filter((l) => l.trim());
+  rawLines.forEach((line, i) => {
+    const cells = (line.includes("\t") ? line.split("\t") : splitCsvLine(line)).map((c) => c.trim());
+    if (!cells[0]) return;
+    if (i === 0 && cells[0].toLowerCase().replace(/[^a-z]/g, "") === "stockno") return; // header row
+    const [stock_no, description, item, unit, qtyRaw, unitCostRaw, accountRaw, asOfRaw,
+      expCode, expName, reorderRaw, batch_no, expiryRaw] = cells;
+    const rowNo = i + 1;
+    if (!stock_no) { errors.push(`Row ${rowNo}: no Stock/Property No.`); return; }
+    const qty = Number(String(qtyRaw || "").replace(/,/g, "")) || 0;
+    if (qty <= 0) { errors.push(`Row ${rowNo}: quantity must be greater than zero.`); return; }
+    const unit_cost = Number(String(unitCostRaw || "").replace(/,/g, "")) || 0;
+    const known = itemByStockNo(fund, stock_no);
+    if (known && hasOpeningBalance(known)) {
+      errors.push(`Row ${rowNo}: ${stock_no} already has an opening balance - skipped so it isn't counted twice.`);
+      return;
+    }
+    let account_code = String(accountRaw || "").trim();
+    if (account_code && !accountInfo(account_code)) {
+      errors.push(`Row ${rowNo}: account code "${account_code}" isn't in the chart of accounts.`);
+      return;
+    }
+    // Unlike the AIR upload, a blank account is NOT quietly defaulted here. An opening balance
+    // filed to the wrong account misstates that account's closing figure for a whole year, and
+    // nothing downstream would ever flag it - so an unrecognised new item has to be told where it
+    // belongs. An item already in the registry keeps the account it was created with.
+    if (!account_code) account_code = (known && known.account_code) || "";
+    if (!account_code) {
+      errors.push(`Row ${rowNo}: ${stock_no} is new and has no Account Code - say which inventory account it belongs to.`);
+      return;
+    }
+    const info = accountInfo(account_code);
+    const med = isMedicineAccount(account_code);
+    const key = String(stock_no).trim().toLowerCase();
+    const rec = byStock.get(key) || {
+      fund, stock_no, existing_id: known ? known.id : null,
+      description: description || (known ? known.description : ""),
+      item: item || (known ? known.item : ""),
+      unit: unit || (known ? known.unit : ""),
+      account_code,
+      account_name: info ? info.name : (known ? known.account_name : ""),
+      expense_account_code: expCode || (info && info.expense ? info.expense.code : "") || (known ? known.expense_account_code : ""),
+      expense_account_name: expName || (info && info.expense ? info.expense.name : "") || (known ? known.expense_account_name : ""),
+      reorder_point: Number(reorderRaw) || (known ? known.reorder_point : 0) || 0,
+      entries: [],
+    };
+    rec.entries.push({
+      id: uid(), type: "receipt", date: normalizeDate(asOfRaw) || todayStr(),
+      ref: OPENING_REF, qty, unit_cost, total_cost: round2(qty * unit_cost),
+      batch_no: med ? (batch_no || "") : "",
+      expiry_date: med ? normalizeDate(expiryRaw) : "",
+      by: S.currentUser.email, at: Date.now(),
+    });
+    byStock.set(key, rec);
+  });
+  return { records: [...byStock.values()], errors };
+}
+
+function previewBulkOpening() {
+  const text = document.getElementById("bulkOpenPaste").value;
+  if (!text.trim()) { toast("Paste some rows or pick a file first.", true); return null; }
+  const { records, errors } = parseBulkOpeningText(text);
+  _bulkOpeningParsed = records;
+  const value = records.reduce((s, r) => s + r.entries.reduce((t, e) => t + e.total_cost, 0), 0);
+  // A blank or zero unit cost is accepted (donated goods can legitimately carry none) but it is
+  // called out loudly: it imports quantity at NO value, which quietly understates the account and
+  // is very hard to spot afterwards from the registry alone.
+  const zeroCost = records.reduce((s, r) => s + r.entries.filter((e) => !e.unit_cost).length, 0);
+  const byAccount = new Map();
+  records.forEach((r) => {
+    const cur = byAccount.get(r.account_code) || { name: r.account_name, value: 0, items: 0 };
+    cur.value += r.entries.reduce((t, e) => t + e.total_cost, 0);
+    cur.items += 1;
+    byAccount.set(r.account_code, cur);
+  });
+  const wrap = document.getElementById("bulkOpenPreview");
+  wrap.innerHTML = `
+    <div class="hr"></div>
+    <h3 style="font-size:13px;">${records.length} item(s) &middot; ${records.reduce((s, r) => s + r.entries.length, 0)} opening receipt(s) &middot; ${fmtMoney(value)}${errors.length ? ` &middot; ${errors.length} row(s) skipped` : ""}</h3>
+    ${zeroCost ? `<div class="panel small" style="margin-top:8px;"><b>⚠ ${zeroCost} row(s) have no unit cost</b> - they will import their quantity at <b>zero value</b>, so the account total above will be short by whatever they are really worth. Fill the Unit Cost column in before importing unless the stock genuinely has no cost.</div>` : ""}
+    ${byAccount.size ? `<div class="panel small"><b>Total by account</b> - check these against your year-end schedule before importing.<div class="table-wrap" style="margin-top:6px;"><table><thead><tr><th>Account</th><th class="num">Items</th><th class="num">Value</th></tr></thead><tbody>
+      ${[...byAccount.entries()].sort().map(([code, a]) => `<tr><td>${esc(code)}<div class="small">${esc(a.name || "")}</div></td><td class="num">${a.items}</td><td class="num">${fmtMoney(a.value)}</td></tr>`).join("")}
+      <tr><td><b>Total</b></td><td class="num"><b>${records.length}</b></td><td class="num"><b>${fmtMoney(value)}</b></td></tr>
+    </tbody></table></div></div>` : ""}
+    ${records.length ? `<div class="table-wrap"><table><thead><tr><th>Stock No.</th><th>Description</th><th>Account</th><th class="num">Lots</th><th class="num">Qty</th><th class="num">Value</th><th></th></tr></thead><tbody>
+      ${records.map((r) => `<tr><td>${esc(r.stock_no)}</td><td>${esc(r.description)}</td><td>${esc(r.account_code)}</td>
+        <td class="num">${r.entries.length}</td>
+        <td class="num">${fmtNum(r.entries.reduce((t, e) => t + e.qty, 0))} ${esc(r.unit)}</td>
+        <td class="num">${fmtMoney(r.entries.reduce((t, e) => t + e.total_cost, 0))}</td>
+        <td class="small">${r.existing_id ? "files into existing item" : `<span class="pill check">new item</span>`}</td></tr>`).join("")}
+    </tbody></table></div>` : ""}
+    ${errors.length ? `<div class="panel small" style="margin-top:10px;"><b>Skipped rows</b><br/>${errors.map(esc).join("<br/>")}</div>` : ""}`;
+  return records;
+}
+
+function importBulkOpening() {
+  if (blockIfViewOnly("registry")) return;
+  const records = _bulkOpeningParsed || previewBulkOpening();
+  if (!records || !records.length) { toast("Nothing to import - check the rows first.", true); return; }
+  const value = records.reduce((s, r) => s + r.entries.reduce((t, e) => t + e.total_cost, 0), 0);
+  if (!confirm(`Import ${records.length} item(s) worth ${fmtMoney(value)} as opening balances into ${fundLabel(S.currentFund)}?\n\nThis adds stock to the registry. Check the totals against your year-end schedule first.`)) return;
+  const writes = records.map((r) => {
+    if (r.existing_id) {
+      const existing = S.items.get(r.existing_id);
+      const ledger = (existing && existing.ledger || []).concat(r.entries);
+      const last = r.entries[r.entries.length - 1];
+      return colItems.doc(r.existing_id).update({ ledger, unit_cost: last.unit_cost, status: "active", updated_at: Date.now() });
+    }
+    const last = r.entries[r.entries.length - 1];
+    return colItems.doc().set({
+      fund: r.fund, account_code: r.account_code, account_name: r.account_name,
+      stock_no: r.stock_no, description: r.description, item: r.item, unit: r.unit,
+      reorder_point: r.reorder_point, unit_cost: last.unit_cost,
+      expense_account_code: r.expense_account_code, expense_account_name: r.expense_account_name,
+      status: "active", ledger: r.entries,
+      created_at: Date.now(), updated_at: Date.now(),
+    });
+  });
+  Promise.all(writes)
+    .then(() => {
+      logAudit("opening_balance_bulk_import", "item", `${records.length} items`, {
+        fund: S.currentFund, items: records.length,
+        receipts: records.reduce((s, r) => s + r.entries.length, 0), value: round2(value),
+      });
+      toast(`${records.length} opening balance(s) imported.`); closeModal();
+    })
+    .catch((e) => toast(e.message, true));
+}
 
 function discontinueItem(id) {
   if (blockIfViewOnly("registry")) return;
@@ -2927,6 +3139,7 @@ function __setTestUser(user) {
 Object.assign(window, {
   setFund, setView, closeModal, __setTestUser, renderAll,
   openItemModal, saveItem, openItemDetail, discontinueItem, reactivateItem,
+  openBulkOpeningModal, downloadOpeningTemplate, previewBulkOpening, importBulkOpening,
   printSlc, printSc, exportRegistryCsv,
   exportMedicinesCsv,
   openAirModal, saveAir, addAirLine, removeAirLine, openAirDetail, deleteAir,
